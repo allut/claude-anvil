@@ -1,0 +1,32 @@
+# Environment / secrets
+.env
+.env.local
+*.env
+
+# Local SQLite DBs (ledger lives in ~/.claude-anvil by default; this covers stray per-project DBs)
+*.db
+*.db-journal
+*.db-wal
+*.db-shm
+.anvil/
+
+# Research / scratch
+.anvil.agent.md
+.ref-*.md
+.scratch/
+tmp/
+
+# Claude Code per-user settings (not part of the plugin distribution)
+.claude/settings.local.json
+
+# Python bytecode
+__pycache__/
+*.pyc
+*.pyo
+
+# OS / editor
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
+*.swp

@@ -1,0 +1,137 @@
+# claude-anvil
+
+> Evidence-first coding agent for **Claude Code CLI**. Port of [burkeholland/anvil](https://github.com/burkeholland/anvil) from GitHub Copilot CLI.
+
+Your coding agent should prove its work. This one does.
+
+`/anvil` verifies every change before you see it — builds, tests, lints, runs IDE diagnostics, then has other AI models (Claude, GPT, Gemini, Ollama) try to break it. Every check is INSERTed into a SQLite ledger; the final Evidence Bundle is a `SELECT`, not prose. If the INSERT didn't happen, the verification didn't happen.
+
+## What you get
+
+- **Adversarial review.** Every change gets attacked by 1 (Medium task) or 3 (Large / 🔴 task) different models in parallel. Claude runs as a Task subagent; GPT / Gemini / Ollama run via Bash scripts. They disagree with each other. That's the point.
+- **SQL verification ledger.** Every build, test, lint, diagnostics, and reviewer verdict lives in `anvil_checks`. The Evidence Bundle is `SELECT ... ORDER BY phase` — the agent can't fake it.
+- **Baseline snapshots.** Before touching anything, anvil records your project's state. After, it diffs. Regressions are caught before you see the code.
+- **Pushback.** Anvil is a senior engineer, not an order taker. If your request introduces tech debt, duplicates existing code, or has a dangerous edge case, it tells you before writing a single line.
+- **Session memory.** A PostToolUse hook tracks every file anvil edits. Next session, if you touch that file again, anvil recalls past failures and accounts for them.
+- **Git autopilot.** Checks git state, stashes uncommitted work, creates a branch, commits the result with a clean rollback command.
+- **Context7 docs.** Bundled MCP server fetches up-to-date library docs so anvil doesn't hallucinate APIs.
+
+## Requirements
+
+- **Claude Code CLI** (2.1.x or newer; plugin support).
+- **Python 3.9+** on your `PATH` — used for the ledger and external reviewer scripts (stdlib only, no `pip install`).
+- **Git** (obviously).
+- **Node.js** (only needed for the bundled Context7 MCP server, launched via `npx`).
+- Optional reviewer credentials (see **Reviewer setup** below). Anvil gracefully degrades if a reviewer isn't configured.
+
+## Install
+
+```bash
+# Clone
+git clone https://github.com/allut/claude-anvil.git
+cd claude-anvil
+
+# Install as a Claude Code plugin (from any Claude Code session):
+/plugin install /absolute/path/to/claude-anvil
+```
+
+Or, if you already have a marketplace configured, add `claude-anvil` to it and `/plugin install claude-anvil@<marketplace>`.
+
+Initialize the ledger once (it'll auto-init on first `/anvil` run, but this lets you verify the install):
+
+```bash
+python scripts/anvil-ledger.py init
+# -> anvil ledger ready at ~/.claude-anvil/anvil.db
+```
+
+## Configure
+
+Copy `.env.example` and fill in whichever reviewers you want to enable:
+
+```bash
+cp .env.example .env
+# edit .env, then:
+export $(grep -v '^#' .env | xargs)
+```
+
+You don't need every reviewer — the dispatcher writes a `"concern: not configured"` stub for any reviewer whose API key is missing or endpoint is unreachable, and the others continue.
+
+### Reviewer setup
+
+| Reviewer | Cost | Get a key |
+|---|---|---|
+| **Claude** (Task subagent) | Covered by your Claude Code plan | Already installed — runs `claude-sonnet-4-6` by default; change the `model:` field in `agents/code-review-claude.md` to any Claude model (e.g. `haiku` for faster/cheaper reviews, `opus` for deeper ones) |
+| **Ollama** (local) | Free | Install from [ollama.com](https://ollama.com/download), then `ollama pull qwen2.5-coder:7b` |
+| **Gemini** (Google AI Studio) | Free tier | [aistudio.google.com/apikey](https://aistudio.google.com/apikey) |
+| **OpenAI** (GPT-5) | **Paid** — no free GPT-5 API | [platform.openai.com/api-keys](https://platform.openai.com/api-keys). Or point `ANVIL_OPENAI_ENDPOINT` at [OpenRouter](https://openrouter.ai) (free-tier models) or [Groq](https://groq.com) (free Llama-3 variants). |
+
+Default roster: Medium = Claude; Large = Claude + Gemini + Ollama. All three defaults are free once you've set up Gemini and pulled an Ollama model.
+
+**Paid / OpenAI-compatible reviewers are live.** `anvil-review.py` POSTs to the configured endpoint via `urllib` — no extra SDK to install. A few provider quirks are handled automatically:
+
+- **GPT-5 and o1/o3**: the `temperature` field is omitted (those models reject anything but `1`).
+- **OpenRouter / Groq**: `HTTP-Referer` and `X-Title` attribution headers are sent unconditionally. If a free-tier model rejects `response_format: {type: json_object}`, set `ANVIL_OPENAI_JSON_MODE=off` and anvil will fall back to extracting JSON from the reply body.
+
+A commit gate blocks `git commit` during an active `/anvil` session when the ledger is missing evidence in any of the three phases (baseline, after, review). Commits outside an anvil session are unaffected.
+
+## Use
+
+From any Claude Code session inside the project you want to edit:
+
+```
+/anvil fix the off-by-one in getNthItem(), plus a regression test
+```
+
+What happens next, on a Medium task:
+
+1. **Boost** — your request is rewritten into a precise spec (hidden unless the intent changed).
+2. **Git hygiene** — checks for uncommitted changes / being on `main`; pushes back if anything looks risky.
+3. **Recall** — queries the SQLite ledger for past anvil runs that touched the same files, so surprises from previous sessions get surfaced.
+4. **Survey** — greps the codebase for existing helpers you should extend instead of re-inventing.
+5. **Baseline** — runs the project's build/tests/diagnostics and INSERTs the results as `phase='baseline'`.
+6. **Implement** — edits the code.
+7. **The Forge** — reruns build/tests/diagnostics (as `phase='after'`), then stages the diff and unleashes one reviewer (Claude by default). The reviewer's JSON verdict is INSERTed as `phase='review', check_name='review-claude'`.
+8. **Evidence Bundle** — rendered from `SELECT * FROM anvil_checks WHERE task_id = ...`. Any regression, any reviewer finding, shows up.
+9. **Commit** — auto-commits with a one-line rollback.
+
+Large tasks (multi-file, auth/crypto/payments, 🔴 files) additionally show a plan step you approve via `AskUserQuestion`, run **three reviewers in parallel**, and include an operational-readiness check (secrets, observability, graceful degradation).
+
+Small tasks (typos, renames, config tweaks) skip the ledger — just Quick Verify + optional commit.
+
+## Inspect the ledger
+
+```bash
+# All checks for a task
+python scripts/anvil-ledger.py select-bundle fix-login-crash
+
+# Has a file been touched by past anvil runs?
+python scripts/anvil-ledger.py recall auth.ts
+
+# Did anything break on this file in the past?
+python scripts/anvil-ledger.py recall-issues auth.ts
+
+# List learned facts (build commands, codebase conventions, etc.)
+python scripts/anvil-ledger.py memory-list
+```
+
+The raw DB is at `~/.claude-anvil/anvil.db`. Open it with any SQLite browser.
+
+## Troubleshooting
+
+- **`anvil-ledger.py: schema missing`** — run `python scripts/anvil-ledger.py init` from the plugin directory so the script can resolve `sql/schema.sql`.
+- **"Ollama unreachable"** — is the daemon running? `curl http://localhost:11434/api/tags`.
+- **Gemini 400 / 403** — the free tier throttles. Wait a minute, or switch `ANVIL_GEMINI_MODEL` to `gemini-2.5-flash`.
+- **Reviewer returned "concern: no parseable verdict"** — the model ignored the JSON-only instruction. Happens occasionally with smaller/older models; `anvil-review.py` attempts to extract the first JSON object from the reply and falls back to `concern` if that fails.
+- **PostToolUse hook isn't tracking edits** — the hook only runs while an anvil session is open (`sessions.ended_at IS NULL`). If `/anvil` crashed partway through, run `python scripts/anvil-ledger.py end-session <id> "crashed"` to close it.
+
+## Security note
+
+`.env` contains API keys. It's gitignored, but double-check your shell history and process listing. The reviewer scripts POST the staged diff to whichever providers you've enabled; don't point GPT/Gemini at diffs you can't share with a third party.
+
+## Credits
+
+The Anvil Loop prompt is adapted from [burkeholland/anvil](https://github.com/burkeholland/anvil) (MIT). The Copilot CLI primitives (`ask_user`, `store_memory`, `session_store`, Copilot multi-vendor subagents) were translated to their Claude Code equivalents; see the [plan file](./.claude/plans) for the translation table.
+
+## License
+
+MIT. See [LICENSE](./LICENSE).
