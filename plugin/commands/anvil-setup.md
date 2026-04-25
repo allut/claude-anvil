@@ -93,7 +93,13 @@ Then `Edit` `agents/code-review-claude.md` to update the `model:` line at line 5
 - `Groq (free Llama-3 variants)` — endpoint `https://api.groq.com/openai/v1/chat/completions`, default model `llama-3.3-70b-versatile`
 - `Custom` — ask via `AskUserQuestion` for the endpoint URL and model id (provide a small set of common ones if possible)
 
-`AskUserQuestion` "Paste your API key for this provider" (the wizard collects via the choice's free-text capability — never echo it back). Treat the value as opaque; pipe it directly into the helper:
+`AskUserQuestion` "Paste your API key for this provider in the 'Other' text field below. It will be stored securely and never echoed.":
+- `I'll type it in Other` — Enter the key in the custom text input below
+- `Skip this reviewer` — Skip and disable the OpenAI-compatible reviewer
+
+If the user picks "Skip this reviewer", set `reviewers.openai.enabled = false` and skip to the next enabled reviewer.
+
+Treat the key as opaque; pipe it directly into the helper:
 
 ```bash
 python "${CLAUDE_PLUGIN_ROOT}/scripts/anvil-config.py" set openai \
@@ -118,7 +124,11 @@ If `off`: `set openai json_mode=off`.
 - `gemini-2.5-pro` (default, deepest)
 - `gemini-2.5-flash` (faster, cheaper-tier rate limits)
 
-`AskUserQuestion` to collect the API key (do not echo).
+`AskUserQuestion` "Paste your Gemini API key in the 'Other' text field below. It will be stored securely and never echoed.":
+- `I'll type it in Other` — Enter the key in the custom text input below
+- `Skip this reviewer` — Skip and disable the Gemini reviewer
+
+If the user picks "Skip this reviewer", set `reviewers.gemini.enabled = false` and skip to the next enabled reviewer.
 
 ```bash
 python "${CLAUDE_PLUGIN_ROOT}/scripts/anvil-config.py" set gemini \
@@ -189,7 +199,7 @@ priority = ['claude', 'gemini', 'openai', 'ollama']
 enabled = [p for p in priority if cfg['reviewers'].get(p, {}).get('enabled')]
 cfg['roster']['medium'] = enabled[:1]
 cfg['roster']['large']  = enabled[:3]
-cfg['setup_completed']  = datetime.datetime.utcnow().strftime('%Y-%m-%dT%H:%M:%SZ')
+cfg['setup_completed']  = datetime.datetime.now(datetime.timezone.utc).strftime('%Y-%m-%dT%H:%M:%SZ')
 print(json.dumps(cfg))
 " | python "${CLAUDE_PLUGIN_ROOT}/scripts/anvil-config.py" save
 ```
@@ -198,7 +208,7 @@ print(json.dumps(cfg))
 
 ```bash
 python "${CLAUDE_PLUGIN_ROOT}/scripts/anvil-ledger.py" init
-python "${CLAUDE_PLUGIN_ROOT}/scripts/anvil-ledger.py" memory-set anvil-setup-completed "$(python -c "import datetime;print(datetime.datetime.utcnow().strftime('%Y-%m-%dT%H:%M:%SZ'))")"
+python "${CLAUDE_PLUGIN_ROOT}/scripts/anvil-ledger.py" memory-set anvil-setup-completed "$(python -c "import datetime;print(datetime.datetime.now(datetime.timezone.utc).strftime('%Y-%m-%dT%H:%M:%SZ'))")"
 ```
 
 ### 8. Summary

@@ -223,6 +223,7 @@ def _dpapi_encrypt(value: str) -> str:
     # Base64-encode the input so no special chars reach PowerShell.
     b64_in = base64.b64encode(value.encode()).decode()
     ps = (
+        "Add-Type -AssemblyName System.Security;"
         f"$b=[Convert]::FromBase64String('{b64_in}');"
         "[Convert]::ToBase64String("
         "[System.Security.Cryptography.ProtectedData]::Protect($b,$null,'CurrentUser'))"
@@ -239,6 +240,7 @@ def _dpapi_decrypt(encoded: str) -> str | None:
         return None
     b64_cipher = encoded[6:]
     ps = (
+        "Add-Type -AssemblyName System.Security;"
         f"$c=[Convert]::FromBase64String('{b64_cipher}');"
         "$p=[System.Security.Cryptography.ProtectedData]::Unprotect($c,$null,'CurrentUser');"
         "[Convert]::ToBase64String($p)"
