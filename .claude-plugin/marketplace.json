@@ -1,5 +1,5 @@
 {
-  "name": "allut-plugins",
+  "name": "allut-claude-anvil",
   "owner": {
     "name": "Aleksei Lutkov",
     "email": "aleksei.lutkov@gmail.com"
@@ -10,7 +10,7 @@
   "plugins": [
     {
       "name": "claude-anvil",
-      "source": ".",
+      "source": "./plugin",
       "description": "Evidence-first coding agent with adversarial multi-model review, SQL verification ledger, and automatic rollback.",
       "homepage": "https://github.com/allut/claude-anvil",
       "repository": "https://github.com/allut/claude-anvil",

@@ -32,7 +32,7 @@ In any Claude Code session:
 
 ```
 /plugin marketplace add allut/claude-anvil
-/plugin install claude-anvil@allut-plugins
+/plugin install claude-anvil@allut-claude-anvil
 ```
 
 ### For development / local install
