@@ -4,7 +4,7 @@
 
 Your coding agent should prove its work. This one does.
 
-`/anvil` verifies every change before you see it — builds, tests, lints, runs IDE diagnostics, then has other AI models (Claude, GPT, Gemini, Ollama) try to break it. Every check is INSERTed into a SQLite ledger; the final Evidence Bundle is a `SELECT`, not prose. If the INSERT didn't happen, the verification didn't happen.
+`/anvil` verifies every change before you see it — builds, tests, lints, runs IDE diagnostics, then has other AI models (Claude, GPT, Gemini, Ollama) try to break it. Every check is INSERTed into a SQLite ledger; the final Evidence Bundle is a `SELECT`, not prose. If the `INSERT` didn't happen, the verification didn't happen.
 
 ## What you get
 
@@ -126,13 +126,26 @@ The raw DB is at `~/.claude-anvil/anvil.db`. Open it with any SQLite browser.
 
 - **`anvil-ledger.py: schema missing`** — run `python scripts/anvil-ledger.py init` from the plugin directory so the script can resolve `sql/schema.sql`.
 - **"Ollama unreachable"** — is the daemon running? `curl http://localhost:11434/api/tags`.
-- **Gemini 400 / 403** — the free tier throttles. Wait a minute, or switch `ANVIL_GEMINI_MODEL` to `gemini-2.5-flash`.
+- **Gemini 400 / 403** — the free tier throttles or the selected model may be unavailable in your region. Re-run `/anvil-setup` and pick a different Gemini model (e.g. `gemini-2.5-flash`) from the wizard's model list.
 - **Reviewer returned "concern: no parseable verdict"** — the model ignored the JSON-only instruction. Happens occasionally with smaller/older models; `anvil-review.py` attempts to extract the first JSON object from the reply and falls back to `concern` if that fails.
 - **PostToolUse hook isn't tracking edits** — the hook only runs while an anvil session is open (`sessions.ended_at IS NULL`). If `/anvil` crashed partway through, run `python scripts/anvil-ledger.py end-session <id> "crashed"` to close it.
 
 ## Security note
 
-`.env` contains API keys. It's gitignored, but double-check your shell history and process listing. The reviewer scripts POST the staged diff to whichever providers you've enabled; don't point GPT/Gemini at diffs you can't share with a third party.
+The Setup Wizard stores API keys in the OS credential store when available — no plaintext lands in `config.json`:
+
+| Platform | Storage |
+|---|---|
+| macOS | macOS Keychain (`security` CLI); `config.json` holds the marker `"keychain"` |
+| Windows | DPAPI-encrypted Base64 inline in `config.json`; unreadable on any other machine or user account |
+| Linux | libsecret via `secret-tool`; `config.json` holds the marker `"keychain"` |
+| Fallback | Plaintext in `config.json` (`chmod 0600`) if no keychain backend is detected |
+
+Run `python scripts/anvil-config.py keychain-status` to see which backend is active and where each key is stored.
+
+The legacy `.env` file (if you use it) is also gitignored. Double-check your shell history and process listing regardless of storage tier.
+
+**Keys vs. diffs:** API keys are sent only to their issuing service (Gemini key → Google, OpenAI key → OpenAI) as authentication credentials — they are not shared with other providers. What *is* sent to each enabled provider is the staged code diff for review; don't point GPT/Gemini at diffs you can't share with a third party.
 
 ## Credits
 

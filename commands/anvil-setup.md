@@ -39,7 +39,11 @@ Three possible outputs: `configured`, `partial`, `needs-setup`.
   On "Cancel": stop.
   On "Reconfigure from scratch": continue to Step 2.
 
-- If `$ARGUMENTS` is `reset`: continue to Step 2 unconditionally.
+- If `$ARGUMENTS` is `reset`: clear existing keychain entries before continuing to Step 2:
+  ```bash
+  python "${CLAUDE_PLUGIN_ROOT}/scripts/anvil-config.py" keychain-delete openai
+  python "${CLAUDE_PLUGIN_ROOT}/scripts/anvil-config.py" keychain-delete gemini
+  ```
 - If output is `partial` or `needs-setup`: continue to Step 2.
 
 ### 2. Pick which reviewers to enable
@@ -100,6 +104,8 @@ python "${CLAUDE_PLUGIN_ROOT}/scripts/anvil-config.py" set openai \
     json_mode="on"
 ```
 
+The helper prints `ok (api_key stored in <location>)` — relay this to the user so they know where the key was saved (macOS Keychain, DPAPI-encrypted, or plaintext).
+
 `AskUserQuestion` "Enable strict JSON mode? (Set to off only if your model rejects `response_format: json_object` — usually free-tier OpenRouter/Groq.)":
 - `on (default, recommended)`
 - `off (for models that reject response_format)`
@@ -120,6 +126,8 @@ python "${CLAUDE_PLUGIN_ROOT}/scripts/anvil-config.py" set gemini \
     model="<choice>" \
     api_key="<key>"
 ```
+
+The helper prints `ok (api_key stored in <location>)` — relay this to the user so they know where the key was saved.
 
 #### 3d. Ollama
 
@@ -202,6 +210,8 @@ Run `python "${CLAUDE_PLUGIN_ROOT}/scripts/anvil-config.py" summary` and present
 - Roster: medium / large.
 - Rollback hint:
   > To redo setup later, run `/anvil-setup reset` or `rm ~/.claude-anvil/config.json`.
+  > Note: `/anvil-setup reset` also removes any keychain entries. If you delete config.json manually, run `python scripts/anvil-config.py keychain-delete openai` and `keychain-delete gemini` to remove keychain entries too.
+- Key storage hint (show output of `python "${CLAUDE_PLUGIN_ROOT}/scripts/anvil-config.py" keychain-status`).
 - Next-step hint:
   > Try `/anvil <task>` now.
 

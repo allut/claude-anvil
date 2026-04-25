@@ -19,6 +19,15 @@ Schema (version 1):
       "roster": {"medium": ["claude"], "large": ["claude", "gemini", "ollama"]}
     }
 
+API keys are stored in the OS keychain when available:
+  - macOS:   macOS Keychain via the `security` CLI
+  - Windows: DPAPI-encrypted Base64 stored inline in config.json
+             (value prefix "dpapi:"; unreadable on other machines/accounts)
+  - Linux:   libsecret via the `secret-tool` CLI
+  - Fallback: plaintext in config.json (chmod 0600 on POSIX)
+In all cases config.json stores only "keychain" (or the dpapi blob) -- the
+plaintext key never lands in the JSON file on platforms with keychain support.
+
 Env vars always win over config.json -- this preserves the legacy `.env`-based
 workflow. The Python reviewer scripts call `get` to resolve credentials with
 that contract enforced in one place.
@@ -28,21 +37,25 @@ Subcommands:
     path                                -> prints absolute config path
     read                                -> prints raw JSON (exit 1 if missing)
     get PROVIDER KEY [--env-var NAME]
-        [--default VAL]                 -> resolves env -> config -> default
+        [--default VAL]                 -> resolves env -> keychain -> config -> default
     roster {medium,large}               -> comma-separated reviewer list
     save                                -> reads JSON config from stdin and writes it (atomic, chmod 0600)
-    set PROVIDER KEY=VALUE [KEY=VALUE]  -> merges into config without rewriting all fields
+    set PROVIDER KEY=VALUE [KEY=VALUE]  -> merges into config; api_key goes to keychain
     validate PROVIDER                   -> tiny live HTTP probe; prints JSON status
     summary                             -> human-readable masked summary
+    keychain-status                     -> shows which backend is active and where each key lives
+    keychain-delete PROVIDER            -> removes keychain entry for a provider's api_key
 """
 from __future__ import annotations
 
 import argparse
+import base64
 import json
 import os
 import re
 import socket
 import ssl
+import subprocess
 import sys
 import tempfile
 import urllib.error
@@ -54,6 +67,8 @@ DEFAULT_CONFIG_REL = "~/.claude-anvil/config.json"
 SCHEMA_VERSION = 1
 PROVIDERS = ("claude", "openai", "gemini", "ollama")
 HTTP_TIMEOUT = 15.0
+KEYCHAIN_SERVICE = "anvil"
+API_KEY_FIELDS = frozenset({"api_key"})
 
 
 # --- path + IO ---------------------------------------------------------------
@@ -144,6 +159,166 @@ def atomic_write(path: Path, text: str) -> None:
         pass  # Windows / non-POSIX -- best effort
 
 
+# --- OS keychain abstraction --------------------------------------------------
+
+_UNSET = object()
+_KEYCHAIN_BACKEND_CACHE: Any = _UNSET
+
+
+def _keychain_backend() -> str | None:
+    """Return 'macos', 'windows-dpapi', 'linux-secret-tool', or None."""
+    global _KEYCHAIN_BACKEND_CACHE
+    if _KEYCHAIN_BACKEND_CACHE is not _UNSET:
+        return _KEYCHAIN_BACKEND_CACHE  # type: ignore[return-value]
+    result: str | None = None
+    if sys.platform == "darwin":
+        try:
+            r = subprocess.run(["which", "security"], capture_output=True, timeout=3)
+            result = "macos" if r.returncode == 0 else None
+        except (FileNotFoundError, subprocess.TimeoutExpired, OSError):
+            result = None
+    elif sys.platform == "win32":
+        result = "windows-dpapi"
+    else:
+        try:
+            r = subprocess.run(["which", "secret-tool"], capture_output=True, timeout=3)
+            result = "linux-secret-tool" if r.returncode == 0 else None
+        except (FileNotFoundError, subprocess.TimeoutExpired, OSError):
+            result = None
+    _KEYCHAIN_BACKEND_CACHE = result
+    return result
+
+
+def _key_id(provider: str) -> str:
+    return f"anvil-{provider}-api-key"
+
+
+# macOS Keychain via `security` CLI
+
+def _macos_write(key_id: str, value: str) -> None:
+    subprocess.run(
+        ["security", "add-generic-password", "-U", "-s", KEYCHAIN_SERVICE, "-a", key_id, "-w", value],
+        check=True, capture_output=True, timeout=10,
+    )
+
+
+def _macos_read(key_id: str) -> str | None:
+    r = subprocess.run(
+        ["security", "find-generic-password", "-s", KEYCHAIN_SERVICE, "-a", key_id, "-w"],
+        capture_output=True, timeout=10,
+    )
+    return r.stdout.decode().strip() if r.returncode == 0 else None
+
+
+def _macos_delete(key_id: str) -> None:
+    subprocess.run(
+        ["security", "delete-generic-password", "-s", KEYCHAIN_SERVICE, "-a", key_id],
+        capture_output=True, timeout=10,
+    )
+
+
+# Windows DPAPI via PowerShell (value stored as "dpapi:<base64>" in config.json)
+
+def _dpapi_encrypt(value: str) -> str:
+    # Base64-encode the input so no special chars reach PowerShell.
+    b64_in = base64.b64encode(value.encode()).decode()
+    ps = (
+        f"$b=[Convert]::FromBase64String('{b64_in}');"
+        "[Convert]::ToBase64String("
+        "[System.Security.Cryptography.ProtectedData]::Protect($b,$null,'CurrentUser'))"
+    )
+    r = subprocess.run(["powershell", "-NoProfile", "-Command", ps],
+                       capture_output=True, timeout=15)
+    if r.returncode != 0:
+        raise RuntimeError(r.stderr.decode().strip())
+    return "dpapi:" + r.stdout.decode().strip()
+
+
+def _dpapi_decrypt(encoded: str) -> str | None:
+    if not encoded.startswith("dpapi:"):
+        return None
+    b64_cipher = encoded[6:]
+    ps = (
+        f"$c=[Convert]::FromBase64String('{b64_cipher}');"
+        "$p=[System.Security.Cryptography.ProtectedData]::Unprotect($c,$null,'CurrentUser');"
+        "[Convert]::ToBase64String($p)"
+    )
+    r = subprocess.run(["powershell", "-NoProfile", "-Command", ps],
+                       capture_output=True, timeout=15)
+    if r.returncode != 0:
+        return None
+    try:
+        return base64.b64decode(r.stdout.decode().strip()).decode()
+    except Exception:
+        return None
+
+
+# Linux libsecret via `secret-tool`
+
+def _linux_write(key_id: str, value: str) -> None:
+    subprocess.run(
+        ["secret-tool", "store", "--label", f"anvil {key_id}",
+         "service", KEYCHAIN_SERVICE, "key", key_id],
+        input=value.encode(), check=True, capture_output=True, timeout=10,
+    )
+
+
+def _linux_read(key_id: str) -> str | None:
+    r = subprocess.run(
+        ["secret-tool", "lookup", "service", KEYCHAIN_SERVICE, "key", key_id],
+        capture_output=True, timeout=10,
+    )
+    return r.stdout.decode().strip() if r.returncode == 0 else None
+
+
+def _linux_delete(key_id: str) -> None:
+    subprocess.run(
+        ["secret-tool", "clear", "service", KEYCHAIN_SERVICE, "key", key_id],
+        capture_output=True, timeout=10,
+    )
+
+
+def _keychain_store(provider: str, value: str) -> tuple[str, str]:
+    """Write value to keychain. Returns (config_value_to_store, human_label)."""
+    backend = _keychain_backend()
+    kid = _key_id(provider)
+    if backend == "macos":
+        _macos_write(kid, value)
+        return "keychain", "macOS Keychain"
+    if backend == "linux-secret-tool":
+        _linux_write(kid, value)
+        return "keychain", "Linux secret-tool (libsecret)"
+    if backend == "windows-dpapi":
+        encrypted = _dpapi_encrypt(value)
+        return encrypted, "config.json (DPAPI-encrypted)"
+    return value, "config.json (plaintext)"
+
+
+def _keychain_load(provider: str, raw_config_value: str) -> str | None:
+    """Resolve a stored api_key value.  Returns the plaintext key, or None."""
+    if raw_config_value == "keychain":
+        backend = _keychain_backend()
+        kid = _key_id(provider)
+        if backend == "macos":
+            return _macos_read(kid)
+        if backend == "linux-secret-tool":
+            return _linux_read(kid)
+        return None
+    if raw_config_value.startswith("dpapi:"):
+        return _dpapi_decrypt(raw_config_value)
+    return raw_config_value if raw_config_value else None
+
+
+def _keychain_remove(provider: str) -> None:
+    backend = _keychain_backend()
+    kid = _key_id(provider)
+    if backend == "macos":
+        _macos_delete(kid)
+    elif backend == "linux-secret-tool":
+        _linux_delete(kid)
+    # DPAPI: the encrypted blob lives in config.json; clearing api_key there is enough.
+
+
 # --- env-var contract -------------------------------------------------------
 
 ENV_VAR_MAP: dict[tuple[str, str], str] = {
@@ -172,7 +347,13 @@ def resolve_value(provider: str, key: str, env_var: str | None, default: str) ->
         merged = merge_with_defaults(cfg)
         v = (merged.get("reviewers", {}).get(provider) or {}).get(key)
         if v not in (None, ""):
-            return str(v)
+            raw = str(v)
+            if key in API_KEY_FIELDS:
+                resolved = _keychain_load(provider, raw)
+                if resolved:
+                    return resolved
+            else:
+                return raw
     return default
 
 
@@ -367,17 +548,30 @@ def cmd_set(args: argparse.Namespace) -> int:
     cfg = load_config() or default_config()
     cfg = merge_with_defaults(cfg)
     block = cfg["reviewers"].setdefault(args.provider, {})
+    key_stored_in: str | None = None
     for assignment in args.assignments:
         if "=" not in assignment:
             print(f"anvil-config: expected KEY=VALUE, got {assignment!r}", file=sys.stderr)
             return 2
         k, v = assignment.split("=", 1)
-        if v.lower() in ("true", "false") and k == "enabled":
+        if k == "enabled" and v.lower() in ("true", "false"):
             block[k] = v.lower() == "true"
+        elif k in API_KEY_FIELDS and v:
+            try:
+                config_val, label = _keychain_store(args.provider, v)
+                block[k] = config_val
+                key_stored_in = label
+            except Exception as e:
+                print(f"anvil-config: keychain store failed ({e}), using plaintext", file=sys.stderr)
+                block[k] = v
+                key_stored_in = "config.json (plaintext)"
         else:
             block[k] = v
     atomic_write(config_path(), json.dumps(cfg, indent=2) + "\n")
-    print("ok")
+    if key_stored_in:
+        print(f"ok (api_key stored in {key_stored_in})")
+    else:
+        print("ok")
     return 0
 
 
@@ -392,27 +586,79 @@ def cmd_validate(args: argparse.Namespace) -> int:
     return 0 if result.get("status") == "ok" else 1
 
 
+def _api_key_display(provider: str, raw: str) -> str:
+    if raw == "keychain":
+        return "(in keychain)"
+    if raw.startswith("dpapi:"):
+        return "(DPAPI-encrypted)"
+    if raw:
+        return f"...{raw[-4:]}"
+    return "(not set)"
+
+
 def cmd_summary(_args: argparse.Namespace) -> int:
     cfg = load_config()
     if cfg is None:
         print(f"(no config at {config_path()})")
         return 0
     merged = merge_with_defaults(cfg)
+    backend = _keychain_backend()
     print(f"config:           {config_path()}")
     print(f"version:          {merged.get('version')}")
     print(f"setup_completed:  {merged.get('setup_completed') or '(not set)'}")
+    print(f"key_storage:      {backend or 'plaintext (no keychain available)'}")
     for name, block in merged["reviewers"].items():
         flag = "ENABLED " if block.get("enabled") else "disabled"
         bits = []
         for k, v in block.items():
             if k == "enabled":
                 continue
-            if k == "api_key" and v:
-                v = f"...{str(v)[-4:]}"
+            if k in API_KEY_FIELDS:
+                v = _api_key_display(name, str(v) if v else "")
             bits.append(f"{k}={v}")
         print(f"  {name:<7} {flag}  {' '.join(bits)}")
     print(f"roster.medium:    {','.join(merged['roster'].get('medium', []))}")
     print(f"roster.large:     {','.join(merged['roster'].get('large', []))}")
+    return 0
+
+
+def cmd_keychain_status(_args: argparse.Namespace) -> int:
+    backend = _keychain_backend()
+    print(f"backend: {backend or 'none — keys will be stored in plaintext'}")
+    cfg = load_config()
+    if not cfg:
+        print("(no config file)")
+        return 0
+    merged = merge_with_defaults(cfg)
+    for provider in ("openai", "gemini"):
+        raw = str((merged.get("reviewers", {}).get(provider) or {}).get("api_key", ""))
+        if raw == "keychain":
+            label = "stored in keychain"
+        elif raw.startswith("dpapi:"):
+            label = "DPAPI-encrypted in config.json"
+        elif raw:
+            label = "PLAINTEXT in config.json — re-run /anvil-setup to encrypt"
+        else:
+            label = "not set"
+        print(f"  {provider} api_key: {label}")
+    return 0
+
+
+def cmd_keychain_delete(args: argparse.Namespace) -> int:
+    if args.provider not in PROVIDERS:
+        print(f"anvil-config: unknown provider '{args.provider}'", file=sys.stderr)
+        return 2
+    _keychain_remove(args.provider)
+    # Also blank the config.json field so no stale marker remains.
+    cfg = load_config()
+    if cfg:
+        merged = merge_with_defaults(cfg)
+        block = merged.get("reviewers", {}).get(args.provider, {})
+        raw = str(block.get("api_key", ""))
+        if raw in ("keychain",) or raw.startswith("dpapi:"):
+            block["api_key"] = ""
+            atomic_write(config_path(), json.dumps(merged, indent=2) + "\n")
+    print(f"keychain entry for {args.provider} removed")
     return 0
 
 
@@ -450,6 +696,13 @@ def build_parser() -> argparse.ArgumentParser:
     v.set_defaults(func=cmd_validate)
 
     sub.add_parser("summary").set_defaults(func=cmd_summary)
+
+    sub.add_parser("keychain-status").set_defaults(func=cmd_keychain_status)
+
+    kd = sub.add_parser("keychain-delete")
+    kd.add_argument("provider", choices=PROVIDERS)
+    kd.set_defaults(func=cmd_keychain_delete)
+
     return p
 
 
