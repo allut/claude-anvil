@@ -15,7 +15,7 @@ The user's argument is:
 ## Rules of engagement
 
 1. **Use `AskUserQuestion` for every choice** — never improvise free-text prompts. Multi-choice only.
-2. **Follow the Interactive Input Rule** (from `commands/anvil.md`) when collecting API keys: `AskUserQuestion` to collect → pipe value into the helper via stdin or a flag → never echo the key back to the user.
+2. **Collect API keys via `gui-key`** — run `python "${CLAUDE_PLUGIN_ROOT}/scripts/anvil-config.py" gui-key <provider>` to open a password-masked GUI dialog. The key never appears in the conversation, shell arguments, or tool results. Do not use `AskUserQuestion` to collect keys and do not use `prompt-key`.
 3. **Never block the user with task work mid-wizard.** This is config only. No `git`, no edits to source code other than `agents/code-review-claude.md:5` (the `model:` line) when the user picks a Claude model.
 4. **All file I/O goes through `${CLAUDE_PLUGIN_ROOT}/scripts/anvil-config.py`.** Don't write `config.json` directly.
 5. **Idempotent.** Re-running this wizard MUST be safe. If the user cancels at any step, leave existing config untouched.
@@ -93,24 +93,24 @@ Then `Edit` `agents/code-review-claude.md` to update the `model:` line at line 5
 - `Groq (free Llama-3 variants)` — endpoint `https://api.groq.com/openai/v1/chat/completions`, default model `llama-3.3-70b-versatile`
 - `Custom` — ask via `AskUserQuestion` for the endpoint URL and model id (provide a small set of common ones if possible)
 
-`AskUserQuestion` "Paste your API key for this provider in the 'Other' text field below. It will be stored securely and never echoed.":
-- `I'll type it in Other` — Enter the key in the custom text input below
-- `Skip this reviewer` — Skip and disable the OpenAI-compatible reviewer
+`AskUserQuestion` "Ready to enter your API key for this provider?":
+- `Yes — open the key dialog` — A password-masked dialog box will appear. The key never appears in the conversation.
+- `Skip this reviewer` — Disable the OpenAI-compatible reviewer and continue.
 
 If the user picks "Skip this reviewer", set `reviewers.openai.enabled = false` and skip to the next enabled reviewer.
 
-Treat the key as opaque; pipe it directly into the helper:
+If "Yes": tell the user "A dialog box will appear — enter your key there. It won't appear in this conversation.", then run:
 
 ```bash
 python "${CLAUDE_PLUGIN_ROOT}/scripts/anvil-config.py" set openai \
     enabled=true \
     endpoint="<chosen endpoint>" \
     model="<chosen model>" \
-    api_key="<key>" \
     json_mode="on"
+python "${CLAUDE_PLUGIN_ROOT}/scripts/anvil-config.py" gui-key openai
 ```
 
-The helper prints `ok (api_key stored in <location>)` — relay this to the user so they know where the key was saved (macOS Keychain, DPAPI-encrypted, or plaintext).
+The `gui-key` command prints `ok (api_key stored in <location>)` — relay this to the user so they know where the key was saved (macOS Keychain, DPAPI-encrypted, or plaintext).
 
 `AskUserQuestion` "Enable strict JSON mode? (Set to off only if your model rejects `response_format: json_object` — usually free-tier OpenRouter/Groq.)":
 - `on (default, recommended)`
@@ -124,20 +124,22 @@ If `off`: `set openai json_mode=off`.
 - `gemini-2.5-pro` (default, deepest)
 - `gemini-2.5-flash` (faster, cheaper-tier rate limits)
 
-`AskUserQuestion` "Paste your Gemini API key in the 'Other' text field below. It will be stored securely and never echoed.":
-- `I'll type it in Other` — Enter the key in the custom text input below
-- `Skip this reviewer` — Skip and disable the Gemini reviewer
+`AskUserQuestion` "Ready to enter your Gemini API key?":
+- `Yes — open the key dialog` — A password-masked dialog box will appear. The key never appears in the conversation.
+- `Skip this reviewer` — Disable the Gemini reviewer and continue.
 
 If the user picks "Skip this reviewer", set `reviewers.gemini.enabled = false` and skip to the next enabled reviewer.
+
+If "Yes": tell the user "A dialog box will appear — enter your key there. It won't appear in this conversation.", then run:
 
 ```bash
 python "${CLAUDE_PLUGIN_ROOT}/scripts/anvil-config.py" set gemini \
     enabled=true \
-    model="<choice>" \
-    api_key="<key>"
+    model="<choice>"
+python "${CLAUDE_PLUGIN_ROOT}/scripts/anvil-config.py" gui-key gemini
 ```
 
-The helper prints `ok (api_key stored in <location>)` — relay this to the user so they know where the key was saved.
+The `gui-key` command prints `ok (api_key stored in <location>)` — relay this to the user so they know where the key was saved.
 
 #### 3d. Ollama
 

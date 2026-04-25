@@ -577,6 +577,78 @@ def cmd_set(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_prompt_key(args: argparse.Namespace) -> int:
+    """Read an API key interactively (no echo) and store it. Key never appears in argv or tool results."""
+    provider = args.provider
+    try:
+        import getpass
+        key = getpass.getpass(f"Enter {provider} API key (input hidden): ")
+    except (EOFError, OSError):
+        key = sys.stdin.readline().rstrip("\n")
+    if not key:
+        print(f"anvil-config: no key entered, {provider} key unchanged", file=sys.stderr)
+        return 1
+    cfg = load_config() or default_config()
+    cfg = merge_with_defaults(cfg)
+    block = cfg["reviewers"].setdefault(provider, {})
+    try:
+        config_val, label = _keychain_store(provider, key)
+        block["api_key"] = config_val
+    except Exception as e:
+        print(f"anvil-config: keychain store failed ({e}), using plaintext", file=sys.stderr)
+        block["api_key"] = key
+        label = "config.json (plaintext)"
+    atomic_write(config_path(), json.dumps(cfg, indent=2) + "\n")
+    print(f"ok (api_key stored in {label})")
+    return 0
+
+
+def cmd_gui_key(args: argparse.Namespace) -> int:
+    """Collect an API key via GUI dialog (no TTY needed). Falls back to getpass, then stdin."""
+    provider = args.provider
+    key = ""
+
+    # Try tkinter password dialog first — works on Windows/macOS/Linux with a display,
+    # no terminal attachment required.
+    try:
+        import tkinter as tk
+        from tkinter import simpledialog
+        root = tk.Tk()
+        root.withdraw()
+        root.attributes("-topmost", True)
+        key = simpledialog.askstring(
+            "API Key Required",
+            f"Enter your {provider} API key:",
+            show="*",
+            parent=root,
+        ) or ""
+        root.destroy()
+    except Exception:
+        # Fall back to getpass (needs a real TTY)
+        try:
+            import getpass
+            key = getpass.getpass(f"Enter {provider} API key (input hidden): ")
+        except (EOFError, OSError):
+            key = sys.stdin.readline().rstrip("\n")
+
+    if not key:
+        print(f"anvil-config: no key entered, {provider} key unchanged", file=sys.stderr)
+        return 1
+    cfg = load_config() or default_config()
+    cfg = merge_with_defaults(cfg)
+    block = cfg["reviewers"].setdefault(provider, {})
+    try:
+        config_val, label = _keychain_store(provider, key)
+        block["api_key"] = config_val
+    except Exception as e:
+        print(f"anvil-config: keychain store failed ({e}), using plaintext", file=sys.stderr)
+        block["api_key"] = key
+        label = "config.json (plaintext)"
+    atomic_write(config_path(), json.dumps(cfg, indent=2) + "\n")
+    print(f"ok (api_key stored in {label})")
+    return 0
+
+
 def cmd_validate(args: argparse.Namespace) -> int:
     fn = VALIDATORS.get(args.provider)
     if fn is None:
@@ -704,6 +776,14 @@ def build_parser() -> argparse.ArgumentParser:
     kd = sub.add_parser("keychain-delete")
     kd.add_argument("provider", choices=PROVIDERS)
     kd.set_defaults(func=cmd_keychain_delete)
+
+    pk = sub.add_parser("prompt-key")
+    pk.add_argument("provider", choices=PROVIDERS)
+    pk.set_defaults(func=cmd_prompt_key)
+
+    gk = sub.add_parser("gui-key")
+    gk.add_argument("provider", choices=PROVIDERS)
+    gk.set_defaults(func=cmd_gui_key)
 
     return p
 
