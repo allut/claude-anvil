@@ -8,6 +8,8 @@
   },
   "license": "MIT",
   "keywords": ["verification", "code-review", "adversarial", "evidence", "anvil"],
+  "repository": "https://github.com/allut/claude-anvil",
+  "homepage": "https://github.com/allut/claude-anvil",
   "commands": "./commands/",
   "agents": "./agents/",
   "hooks": "./hooks/hooks.json",

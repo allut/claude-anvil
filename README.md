@@ -26,16 +26,21 @@ Your coding agent should prove its work. This one does.
 
 ## Install
 
-```bash
-# Clone
-git clone https://github.com/allut/claude-anvil.git
-cd claude-anvil
+### From GitHub (recommended)
 
-# Install as a Claude Code plugin (from any Claude Code session):
-/plugin install /absolute/path/to/claude-anvil
+In any Claude Code session:
+
+```
+/plugin marketplace add allut/claude-anvil
+/plugin install claude-anvil@allut-plugins
 ```
 
-Or, if you already have a marketplace configured, add `claude-anvil` to it and `/plugin install claude-anvil@<marketplace>`.
+### For development / local install
+
+```bash
+git clone https://github.com/allut/claude-anvil.git
+claude --plugin-dir ./claude-anvil
+```
 
 Initialize the ledger once (it'll auto-init on first `/anvil` run, but this lets you verify the install):
 

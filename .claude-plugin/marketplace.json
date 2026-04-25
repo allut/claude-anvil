@@ -1,0 +1,22 @@
+{
+  "name": "allut-plugins",
+  "owner": {
+    "name": "Aleksei Lutkov",
+    "email": "aleksei.lutkov@gmail.com"
+  },
+  "metadata": {
+    "description": "Claude Code plugins by Aleksei Lutkov"
+  },
+  "plugins": [
+    {
+      "name": "claude-anvil",
+      "source": ".",
+      "description": "Evidence-first coding agent with adversarial multi-model review, SQL verification ledger, and automatic rollback.",
+      "homepage": "https://github.com/allut/claude-anvil",
+      "repository": "https://github.com/allut/claude-anvil",
+      "license": "MIT",
+      "keywords": ["verification", "code-review", "adversarial", "evidence", "anvil"],
+      "category": "development"
+    }
+  ]
+}
