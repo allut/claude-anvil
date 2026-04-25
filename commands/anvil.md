@@ -102,6 +102,22 @@ python "${CLAUDE_PLUGIN_ROOT}/scripts/anvil-ledger.py" insert-check \
 
 Steps 0–3b produce **minimal output** — give a one-sentence status text when you transition between steps; call tools as needed; don't emit conversational prose until the final presentation. Exceptions: pushback callouts (if triggered), boosted prompt (if intent changed), and reuse opportunities (Step 2) are shown when they occur.
 
+### -1. First-run check (silent unless triggered)
+
+Before Boost, run:
+
+```bash
+python "${CLAUDE_PLUGIN_ROOT}/scripts/anvil-config.py" status
+```
+
+If it prints `needs-setup`, stop the loop and tell the user:
+
+> 🔧 **First-run setup required.** Run `/anvil-setup` once to pick reviewers and collect API keys. After that, re-run `/anvil <your task>`.
+
+Do NOT auto-invoke the wizard mid-task — the user already issued a task; ask them to run setup first so the wizard's questions don't get tangled with task questions.
+
+If it prints `partial`, surface a one-line note in the final summary ("⚠️ anvil config is partial; consider re-running `/anvil-setup`") but proceed.
+
 ### 0. Boost (silent unless intent changed)
 
 Rewrite the user's request into a precise specification. Fix typos, infer target files/modules (use `Grep`/`Glob`), expand shorthand into concrete criteria, add obvious implied constraints.
@@ -248,9 +264,15 @@ git --no-pager diff --staged > /tmp/anvil-diff-"$TASK_ID".patch
 
 **Claude (Task subagent) is the ONLY reviewer you can spawn with a Claude model.** GPT / Gemini / Ollama are each invoked via a Bash call to `anvil-review.py`. Issue `Task` and `Bash` calls in the **same assistant turn** so they run in parallel.
 
-Roster selection is env-driven:
-- **Medium (no 🔴 files)**: pick one reviewer from `ANVIL_MEDIUM_REVIEWER` (default: `claude`).
-- **Large OR 🔴 files**: pick three from `ANVIL_LARGE_REVIEWERS` (default: `claude,gemini,ollama`). If an env var is unset or a provider lacks credentials, skip that reviewer and pick the next available one. If fewer than the required number are available, INSERT a check `--check reviewer-unavailable` explaining the gap and proceed.
+Roster selection is config-driven (env vars still win when set):
+
+```bash
+ANVIL_MEDIUM=$(python "${CLAUDE_PLUGIN_ROOT}/scripts/anvil-config.py" roster medium)
+ANVIL_LARGE=$(python "${CLAUDE_PLUGIN_ROOT}/scripts/anvil-config.py" roster large)
+```
+
+- **Medium (no 🔴 files)**: pick one reviewer from `$ANVIL_MEDIUM` (default: `claude`). The helper honours `ANVIL_MEDIUM_REVIEWER` if exported, else reads `~/.claude-anvil/config.json`.
+- **Large OR 🔴 files**: pick up to three from `$ANVIL_LARGE` (default: `claude,gemini,ollama`). The helper honours `ANVIL_LARGE_REVIEWERS` if exported, else reads `~/.claude-anvil/config.json`. If a provider lacks credentials, skip that reviewer and pick the next available one. If fewer than the required number are available, INSERT a check `--check reviewer-unavailable` explaining the gap and proceed.
 
 **Claude reviewer call (Task tool):**
 

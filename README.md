@@ -46,31 +46,32 @@ python scripts/anvil-ledger.py init
 
 ## Configure
 
-Copy `.env.example` and fill in whichever reviewers you want to enable:
+Run `/anvil-setup` from any Claude Code session. The wizard will:
 
-```bash
-cp .env.example .env
-# edit .env, then:
-export $(grep -v '^#' .env | xargs)
-```
+- Ask which reviewers to enable (Claude / Gemini / Ollama / OpenAI-compatible).
+- Collect API keys, validate each with a small live request, and write them to `~/.claude-anvil/config.json` (chmod `0600` on POSIX).
+- Pick the Claude reviewer's model (`sonnet` / `haiku` / `opus`).
+- Offer to `ollama pull` if Ollama is enabled and the model isn't pulled yet.
 
-You don't need every reviewer — the dispatcher writes a `"concern: not configured"` stub for any reviewer whose API key is missing or endpoint is unreachable, and the others continue.
+You can re-run `/anvil-setup` any time to reconfigure, or `/anvil-setup reset` to wipe and start over.
 
-### Reviewer setup
+### Reviewer options
 
 | Reviewer | Cost | Get a key |
 |---|---|---|
-| **Claude** (Task subagent) | Covered by your Claude Code plan | Already installed — runs `claude-sonnet-4-6` by default; change the `model:` field in `agents/code-review-claude.md` to any Claude model (e.g. `haiku` for faster/cheaper reviews, `opus` for deeper ones) |
-| **Ollama** (local) | Free | Install from [ollama.com](https://ollama.com/download), then `ollama pull qwen2.5-coder:7b` |
+| **Claude** (Task subagent) | Covered by your Claude Code plan | Already installed — wizard picks the model (`sonnet` default, `haiku` faster/cheaper, `opus` deepest) |
+| **Ollama** (local) | Free | Install from [ollama.com](https://ollama.com/download); the wizard offers to `ollama pull` your chosen model |
 | **Gemini** (Google AI Studio) | Free tier | [aistudio.google.com/apikey](https://aistudio.google.com/apikey) |
-| **OpenAI** (GPT-5) | **Paid** — no free GPT-5 API | [platform.openai.com/api-keys](https://platform.openai.com/api-keys). Or point `ANVIL_OPENAI_ENDPOINT` at [OpenRouter](https://openrouter.ai) (free-tier models) or [Groq](https://groq.com) (free Llama-3 variants). |
+| **OpenAI-compatible** | **Paid** for openai.com GPT-5; free via [OpenRouter](https://openrouter.ai) / [Groq](https://groq.com) | The wizard offers OpenAI / OpenRouter / Groq presets, or a custom endpoint |
 
-Default roster: Medium = Claude; Large = Claude + Gemini + Ollama. All three defaults are free once you've set up Gemini and pulled an Ollama model.
+Default roster after wizard: Medium = first enabled reviewer; Large = up to 3 enabled reviewers (priority `claude > gemini > openai > ollama`).
 
-**Paid / OpenAI-compatible reviewers are live.** `anvil-review.py` POSTs to the configured endpoint via `urllib` — no extra SDK to install. A few provider quirks are handled automatically:
+**Power users:** any `ANVIL_*` env var still wins over `config.json`, so the legacy `.env`-based flow keeps working — see `.env.example` for the full list. The dispatcher (`anvil-review.py`) reads env first, then `config.json`, then defaults.
+
+**Provider quirks handled automatically:**
 
 - **GPT-5 and o1/o3**: the `temperature` field is omitted (those models reject anything but `1`).
-- **OpenRouter / Groq**: `HTTP-Referer` and `X-Title` attribution headers are sent unconditionally. If a free-tier model rejects `response_format: {type: json_object}`, set `ANVIL_OPENAI_JSON_MODE=off` and anvil will fall back to extracting JSON from the reply body.
+- **OpenRouter / Groq**: `HTTP-Referer` and `X-Title` attribution headers are sent unconditionally. If a free-tier model rejects `response_format: {type: json_object}`, the wizard's "JSON mode = off" toggle (or `ANVIL_OPENAI_JSON_MODE=off`) makes anvil fall back to extracting JSON from the reply body.
 
 A commit gate blocks `git commit` during an active `/anvil` session when the ledger is missing evidence in any of the three phases (baseline, after, review). Commits outside an anvil session are unaffected.
 
@@ -130,7 +131,7 @@ The raw DB is at `~/.claude-anvil/anvil.db`. Open it with any SQLite browser.
 
 ## Credits
 
-The Anvil Loop prompt is adapted from [burkeholland/anvil](https://github.com/burkeholland/anvil) (MIT). The Copilot CLI primitives (`ask_user`, `store_memory`, `session_store`, Copilot multi-vendor subagents) were translated to their Claude Code equivalents; see the [plan file](./.claude/plans) for the translation table.
+The Anvil Loop prompt is adapted from [burkeholland/anvil](https://github.com/burkeholland/anvil) (MIT). The Copilot CLI primitives (`ask_user`, `store_memory`, `session_store`, Copilot multi-vendor subagents) were translated to their Claude Code equivalents.
 
 ## License
 

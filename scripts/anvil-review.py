@@ -41,6 +41,41 @@ import urllib.error
 import urllib.request
 from pathlib import Path
 
+# --- config.json fallback ----------------------------------------------------
+# Env vars always win. If an env var is unset, fall back to whichever value
+# was written by the /anvil-setup wizard at ~/.claude-anvil/config.json.
+# Read once per process to keep call_* hot paths cheap.
+
+_CONFIG_CACHE: dict | None = None
+_CONFIG_LOADED = False
+
+
+def _config_path() -> Path:
+    raw = os.environ.get("ANVIL_CONFIG_PATH", "~/.claude-anvil/config.json")
+    return Path(os.path.expanduser(os.path.expandvars(raw)))
+
+
+def _config_value(provider: str, key: str, default: str = "") -> str:
+    global _CONFIG_CACHE, _CONFIG_LOADED
+    if not _CONFIG_LOADED:
+        _CONFIG_LOADED = True
+        try:
+            _CONFIG_CACHE = json.loads(_config_path().read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            _CONFIG_CACHE = None
+    if not _CONFIG_CACHE:
+        return default
+    block = (_CONFIG_CACHE.get("reviewers") or {}).get(provider) or {}
+    val = block.get(key)
+    return str(val) if val not in (None, "") else default
+
+
+def _setting(provider: str, key: str, env_var: str, default: str = "") -> str:
+    v = os.environ.get(env_var)
+    if v not in (None, ""):
+        return v
+    return _config_value(provider, key, default)
+
 SHARED_PROMPT = (
     "You are a senior code reviewer performing an adversarial review.\n"
     "Review the staged diff below.\n\n"
@@ -151,10 +186,11 @@ def _openai_model_is_reasoning(model: str) -> bool:
 
 
 def call_openai(diff: str, truncated: bool) -> tuple[dict, str]:
-    endpoint = os.environ.get("ANVIL_OPENAI_ENDPOINT", "https://api.openai.com/v1/chat/completions")
-    api_key = os.environ.get("ANVIL_OPENAI_API_KEY", "")
-    model = os.environ.get("ANVIL_OPENAI_MODEL", "gpt-5")
-    json_mode = os.environ.get("ANVIL_OPENAI_JSON_MODE", "on").strip().lower() != "off"
+    endpoint = _setting("openai", "endpoint", "ANVIL_OPENAI_ENDPOINT",
+                        "https://api.openai.com/v1/chat/completions")
+    api_key = _setting("openai", "api_key", "ANVIL_OPENAI_API_KEY", "")
+    model = _setting("openai", "model", "ANVIL_OPENAI_MODEL", "gpt-5")
+    json_mode = _setting("openai", "json_mode", "ANVIL_OPENAI_JSON_MODE", "on").strip().lower() != "off"
     if not api_key:
         raise RuntimeError("ANVIL_OPENAI_API_KEY is not set")
     payload: dict = {
@@ -180,10 +216,10 @@ def call_openai(diff: str, truncated: bool) -> tuple[dict, str]:
 
 
 def call_gemini(diff: str, truncated: bool) -> tuple[dict, str]:
-    api_key = os.environ.get("ANVIL_GEMINI_API_KEY", "")
-    model = os.environ.get("ANVIL_GEMINI_MODEL", "gemini-2.5-pro")
-    endpoint = os.environ.get(
-        "ANVIL_GEMINI_ENDPOINT",
+    api_key = _setting("gemini", "api_key", "ANVIL_GEMINI_API_KEY", "")
+    model = _setting("gemini", "model", "ANVIL_GEMINI_MODEL", "gemini-2.5-pro")
+    endpoint = _setting(
+        "gemini", "endpoint", "ANVIL_GEMINI_ENDPOINT",
         f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent",
     )
     if not api_key:
@@ -201,8 +237,8 @@ def call_gemini(diff: str, truncated: bool) -> tuple[dict, str]:
 
 
 def call_ollama(diff: str, truncated: bool) -> tuple[dict, str]:
-    host = os.environ.get("ANVIL_OLLAMA_HOST", "http://localhost:11434").rstrip("/")
-    model = os.environ.get("ANVIL_OLLAMA_MODEL", "qwen2.5-coder:7b")
+    host = _setting("ollama", "host", "ANVIL_OLLAMA_HOST", "http://localhost:11434").rstrip("/")
+    model = _setting("ollama", "model", "ANVIL_OLLAMA_MODEL", "qwen2.5-coder:7b")
     payload = {
         "model": model,
         "messages": [
@@ -245,7 +281,7 @@ def main(argv: list[str] | None = None) -> int:
     diff, truncated = read_diff(diff_path)
     handler = PROVIDERS[args.provider]
     error: str | None = None
-    model = os.environ.get(f"ANVIL_{args.provider.upper()}_MODEL", "")
+    model = _setting(args.provider, "model", f"ANVIL_{args.provider.upper()}_MODEL", "")
     raw: dict = {}
 
     try:
