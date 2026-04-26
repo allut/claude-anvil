@@ -53,7 +53,7 @@ Three possible outputs: `configured`, `partial`, `needs-setup`.
 | Option | Description |
 |---|---|
 | Claude (Task subagent) | Free with your Claude Code plan. Strongly recommended. |
-| OpenAI-compatible | Paid (gpt-5/o-series) OR free via OpenRouter / Groq. |
+| OpenAI-compatible | Paid (gpt-4o/o-series) OR free via OpenRouter / Groq. |
 | Gemini (Google AI Studio) | Free tier from aistudio.google.com/apikey. |
 | Ollama (local) | Free; needs a local Ollama daemon. |
 
@@ -69,7 +69,7 @@ python "${CLAUDE_PLUGIN_ROOT}/scripts/anvil-config.py" read 2>/dev/null
 ```
 If `read` exits non-zero (no existing config), use this default skeleton:
 ```json
-{"version":1,"setup_completed":"","reviewers":{"claude":{"enabled":false,"model":"sonnet"},"openai":{"enabled":false,"endpoint":"https://api.openai.com/v1/chat/completions","api_key":"","model":"gpt-5","json_mode":"on"},"gemini":{"enabled":false,"api_key":"","model":"gemini-2.5-pro","endpoint":""},"ollama":{"enabled":false,"host":"http://localhost:11434","model":"qwen2.5-coder:7b"}},"roster":{"medium":["claude"],"large":["claude","gemini","ollama"]}}
+{"version":1,"setup_completed":"","reviewers":{"claude":{"enabled":false,"model":"sonnet"},"openai":{"enabled":false,"endpoint":"https://api.openai.com/v1/chat/completions","api_key":"","model":"gpt-4o","json_mode":"on"},"gemini":{"enabled":false,"api_key":"","model":"gemini-2.5-pro","endpoint":""},"ollama":{"enabled":false,"host":"http://localhost:11434","model":"qwen2.5-coder:7b"}},"roster":{"medium":["claude"],"large":["claude","gemini","ollama"]}}
 ```
 
 For each reviewer in `$ENABLED`, run the matching block. Set `reviewers.<name>.enabled = true`; set `enabled = false` for any not selected.
@@ -88,7 +88,7 @@ Then `Edit` `agents/code-review-claude.md` to update the `model:` line at line 5
 #### 3b. OpenAI-compatible
 
 `AskUserQuestion` "Pick a provider":
-- `OpenAI (paid, gpt-5)` — endpoint `https://api.openai.com/v1/chat/completions`, default model `gpt-5`
+- `OpenAI (paid, gpt-4o)` — endpoint `https://api.openai.com/v1/chat/completions`, default model `gpt-4o`
 - `OpenRouter (free tier available)` — endpoint `https://openrouter.ai/api/v1/chat/completions`, default model `openai/gpt-oss-120b:free`
 - `Groq (free Llama-3 variants)` — endpoint `https://api.groq.com/openai/v1/chat/completions`, default model `llama-3.3-70b-versatile`
 - `Custom` — ask via `AskUserQuestion` for the endpoint URL and model id (provide a small set of common ones if possible)

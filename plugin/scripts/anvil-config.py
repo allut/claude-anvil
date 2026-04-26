@@ -10,7 +10,7 @@ Schema (version 1):
       "reviewers": {
         "claude": {"enabled": true,  "model": "sonnet"},
         "openai": {"enabled": false, "endpoint": "...", "api_key": "",
-                    "model": "gpt-5", "json_mode": "on"},
+                    "model": "gpt-4o", "json_mode": "on"},
         "gemini": {"enabled": false, "api_key": "", "model": "gemini-2.5-pro",
                     "endpoint": ""},
         "ollama": {"enabled": false, "host": "http://localhost:11434",
@@ -50,6 +50,7 @@ from __future__ import annotations
 
 import argparse
 import base64
+import copy
 import json
 import os
 import re
@@ -59,6 +60,7 @@ import subprocess
 import sys
 import tempfile
 import urllib.error
+import urllib.parse
 import urllib.request
 from pathlib import Path
 from typing import Any
@@ -88,7 +90,7 @@ def default_config() -> dict[str, Any]:
                 "enabled": False,
                 "endpoint": "https://api.openai.com/v1/chat/completions",
                 "api_key": "",
-                "model": "gpt-5",
+                "model": "gpt-4o",
                 "json_mode": "on",
             },
             "gemini": {
@@ -116,8 +118,15 @@ def load_config() -> dict[str, Any] | None:
         return None
     try:
         return json.loads(p.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError):
+    except OSError:
         return None
+    except json.JSONDecodeError as e:
+        print(
+            f"anvil-config: config.json is corrupted ({e}); "
+            f"delete {p} and re-run /anvil-setup",
+            file=sys.stderr,
+        )
+        sys.exit(1)
 
 
 def merge_with_defaults(cfg: dict[str, Any]) -> dict[str, Any]:
@@ -125,7 +134,7 @@ def merge_with_defaults(cfg: dict[str, Any]) -> dict[str, Any]:
     base = default_config()
     if not isinstance(cfg, dict):
         return base
-    out = base
+    out = copy.deepcopy(base)
     out["version"] = cfg.get("version", SCHEMA_VERSION)
     out["setup_completed"] = cfg.get("setup_completed", "")
     reviewers = cfg.get("reviewers") or {}
@@ -389,12 +398,13 @@ def validate_openai() -> dict[str, str]:
     endpoint = resolve_value("openai", "endpoint", None,
                              "https://api.openai.com/v1/chat/completions")
     api_key = resolve_value("openai", "api_key", None, "")
-    model = resolve_value("openai", "model", None, "gpt-5")
+    model = resolve_value("openai", "model", None, "gpt-4o")
     if not api_key:
         return {"status": "unauthorized", "detail": "ANVIL_OPENAI_API_KEY / config.api_key is empty"}
     # Derive /v1/models from a chat-completions endpoint.
-    base = re.sub(r"/chat/completions/?$", "", endpoint.rstrip("/"))
-    url = f"{base}/models"
+    parsed = urllib.parse.urlparse(endpoint)
+    base_path = parsed.path.rsplit("/chat/completions", 1)[0].rstrip("/")
+    url = urllib.parse.urlunparse(parsed._replace(path=f"{base_path}/models", query="", fragment=""))
     try:
         _, data, body = _http_get_json(url, {"Authorization": f"Bearer {api_key}"})
     except urllib.error.HTTPError as e:
@@ -507,12 +517,25 @@ def cmd_roster(args: argparse.Namespace) -> int:
     if args.kind == "medium":
         env = os.environ.get("ANVIL_MEDIUM_REVIEWER", "").strip()
         if env:
-            print(env.split(",")[0].strip())
+            parts = [p.strip() for p in env.split(",") if p.strip()]
+            if len(parts) > 1:
+                print(
+                    f"anvil-config: ANVIL_MEDIUM_REVIEWER has {len(parts)} entries; "
+                    f"only the first will be used for medium tasks",
+                    file=sys.stderr,
+                )
+            print(parts[0] if parts else "")
             return 0
     else:
         env = os.environ.get("ANVIL_LARGE_REVIEWERS", "").strip()
         if env:
-            print(env)
+            parts = [p.strip() for p in env.split(",") if p.strip()]
+            if len(parts) > 3:
+                print(
+                    f"anvil-config: ANVIL_LARGE_REVIEWERS has {len(parts)} entries; only the first 3 will be used",
+                    file=sys.stderr,
+                )
+            print(",".join(parts[:3]))
             return 0
     cfg = load_config()
     if cfg is None:

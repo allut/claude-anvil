@@ -31,6 +31,8 @@ CREATE TABLE IF NOT EXISTS sessions (
     created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
     ended_at   DATETIME
 );
+CREATE INDEX IF NOT EXISTS ix_sessions_ended_at ON sessions(ended_at);
+CREATE INDEX IF NOT EXISTS ix_sessions_created_at ON sessions(created_at);
 
 -- Populated by the PostToolUse hook on every Edit/Write/MultiEdit, plus explicit track-edit calls.
 -- Enables the Recall step ("has this file been touched by a past session?").

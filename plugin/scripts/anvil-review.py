@@ -22,7 +22,7 @@ Usage:
                     [--out PATH]        # default /tmp/anvil-review-{provider}-{task_id}.json
 
 Output:
-    - Stdout: one line, e.g. "reviewer=openai verdict=pass findings=0 model=gpt-5"
+    - Stdout: one line, e.g. "reviewer=openai verdict=pass findings=0 model=gpt-4o"
     - File:   the full JSON verdict (plus metadata) at --out
     - Exit 0 if we got a verdict (even "concern" / "fail" ones).
     - Exit 1 if the provider was unreachable or misconfigured. A stub verdict
@@ -189,7 +189,7 @@ def call_openai(diff: str, truncated: bool) -> tuple[dict, str]:
     endpoint = _setting("openai", "endpoint", "ANVIL_OPENAI_ENDPOINT",
                         "https://api.openai.com/v1/chat/completions")
     api_key = _setting("openai", "api_key", "ANVIL_OPENAI_API_KEY", "")
-    model = _setting("openai", "model", "ANVIL_OPENAI_MODEL", "gpt-5")
+    model = _setting("openai", "model", "ANVIL_OPENAI_MODEL", "gpt-4o")
     json_mode = _setting("openai", "json_mode", "ANVIL_OPENAI_JSON_MODE", "on").strip().lower() != "off"
     if not api_key:
         raise RuntimeError("ANVIL_OPENAI_API_KEY is not set")
@@ -288,6 +288,15 @@ def main(argv: list[str] | None = None) -> int:
         raw, model = handler(diff, truncated)
     except RuntimeError as e:
         error = str(e)
+    except urllib.error.HTTPError as e:
+        try:
+            body = e.read().decode("utf-8", errors="replace")[:300]
+        except Exception:
+            body = ""
+        if e.code in (401, 403):
+            error = f"{args.provider} authentication failed (HTTP {e.code}): {body}"
+        else:
+            error = f"{args.provider} HTTP {e.code} {e.reason}: {body}"
     except (urllib.error.URLError, TimeoutError, ConnectionError) as e:
         error = f"{args.provider} unreachable: {e}"
     except Exception as e:  # noqa: BLE001 -- catch-all keeps the /anvil loop alive

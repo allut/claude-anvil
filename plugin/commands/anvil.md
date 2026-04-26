@@ -1,7 +1,7 @@
 ---
 description: Evidence-first coding loop. Verifies before presenting, attacks its own output with up to 3 models, records every check in SQL. Ported from burkeholland/anvil.
 argument-hint: <what you want anvil to do>
-allowed-tools: Bash, Read, Edit, Write, MultiEdit, Glob, Grep, Task, AskUserQuestion, WebFetch, mcp__ide__getDiagnostics, mcp__plugin_context7_context7__resolve-library-id, mcp__plugin_context7_context7__query-docs
+allowed-tools: Bash, Read, Edit, Write, MultiEdit, Glob, Grep, Task, AskUserQuestion, WebFetch, mcp__ide__getDiagnostics, mcp__plugin_claude-anvil_context7__resolve-library-id, mcp__plugin_claude-anvil_context7__query-docs
 ---
 
 # Anvil
@@ -22,7 +22,7 @@ This plugin ships a SQLite verification ledger and a few helper scripts. You int
 - **External adversarial reviewers** (GPT, Gemini, Ollama): `python "${CLAUDE_PLUGIN_ROOT}/scripts/anvil-review.py" --provider openai|gemini|ollama --task-id TASK_ID --diff-file /tmp/anvil-diff-TASK_ID.patch`. Writes a JSON verdict you then read and INSERT into the ledger.
 - **Claude adversarial reviewer**: invoke `Task(subagent_type="code-review-claude", ...)` (see 5c below).
 - **IDE diagnostics**: call `mcp__ide__getDiagnostics` directly.
-- **Library docs**: `mcp__plugin_context7_context7__resolve-library-id` then `mcp__plugin_context7_context7__query-docs`.
+- **Library docs**: `mcp__plugin_claude-anvil_context7__resolve-library-id` then `mcp__plugin_claude-anvil_context7__query-docs`.
 - **User questions**: `AskUserQuestion`. Never improvise a text-only question when a decision is required.
 
 Call `anvil-ledger.py init` exactly once at the start of a Medium/Large task — it is idempotent and creates `~/.claude-anvil/anvil.db` on first run.
@@ -423,8 +423,8 @@ Once confirmed working, save with `memory-set`.
 ## Documentation Lookup
 
 When unsure about a library/framework, use Context7:
-1. `mcp__plugin_context7_context7__resolve-library-id` with the library name.
-2. `mcp__plugin_context7_context7__query-docs` with the resolved ID and your question.
+1. `mcp__plugin_claude-anvil_context7__resolve-library-id` with the library name.
+2. `mcp__plugin_claude-anvil_context7__query-docs` with the resolved ID and your question.
 
 Do this BEFORE guessing at API usage.
 

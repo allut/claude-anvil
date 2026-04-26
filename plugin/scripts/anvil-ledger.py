@@ -38,10 +38,8 @@ SCHEMA_PATH = REPO_DIR / "sql" / "schema.sql"
 
 SNIPPET_MAX = 4000
 
-
-def db_path() -> Path:
-    raw = os.environ.get("ANVIL_DB_PATH", "~/.claude-anvil/anvil.db")
-    return Path(os.path.expanduser(os.path.expandvars(raw)))
+sys.path.insert(0, str(SCRIPT_DIR))
+from anvil_shared import db_path  # noqa: E402
 
 
 def connect() -> sqlite3.Connection:
@@ -93,7 +91,14 @@ def cmd_init(_args: argparse.Namespace) -> None:
 def cmd_insert_check(args: argparse.Namespace) -> None:
     output = ""
     if args.output_file:
-        output = Path(args.output_file).read_text(encoding="utf-8", errors="replace")
+        p = Path(args.output_file)
+        if p.exists():
+            output = p.read_text(encoding="utf-8", errors="replace")
+        else:
+            print(
+                f"anvil-ledger: warning: --output-file {args.output_file!r} not found; recording empty output",
+                file=sys.stderr,
+            )
     elif args.output is not None:
         output = args.output
     output = clip(output)
@@ -105,6 +110,17 @@ def cmd_insert_check(args: argparse.Namespace) -> None:
         (args.task_id, args.phase, args.check, args.tool,
          args.command or "", args.exit_code, output, args.passed),
     )
+    # Feed review-phase findings into the FTS index so recall-issues can surface them.
+    if args.phase == "review" and output:
+        row = conn.execute(
+            "SELECT id FROM sessions WHERE task_id = ? ORDER BY id DESC LIMIT 1",
+            (args.task_id,),
+        ).fetchone()
+        if row:
+            conn.execute(
+                "INSERT INTO search_index (content, session_id, source_type) VALUES (?, ?, 'review')",
+                (clip(output, 500), row[0]),
+            )
     conn.commit()
     print("ok")
 
@@ -170,7 +186,12 @@ def cmd_track_edit(args: argparse.Namespace) -> None:
     print("ok")
 
 
+def _escape_like(pattern: str) -> str:
+    return pattern.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+
+
 def cmd_recall(args: argparse.Namespace) -> None:
+    escaped = _escape_like(args.pattern)
     conn = connect()
     conn.row_factory = sqlite3.Row
     rows = conn.execute(
@@ -178,15 +199,16 @@ def cmd_recall(args: argparse.Namespace) -> None:
                   substr(COALESCE(s.summary, ''), 1, 80) AS summary, s.created_at
            FROM session_files sf
            JOIN sessions s ON sf.session_id = s.id
-           WHERE sf.file_path LIKE ?
+           WHERE sf.file_path LIKE ? ESCAPE '\\'
            ORDER BY s.created_at DESC
            LIMIT 5""",
-        (f"%{args.pattern}%",),
+        (f"%{escaped}%",),
     ).fetchall()
     print_table(rows, ["session", "task_id", "branch", "file_path", "tool_name", "summary", "created_at"])
 
 
 def cmd_recall_issues(args: argparse.Namespace) -> None:
+    escaped = _escape_like(args.pattern)
     conn = connect()
     conn.row_factory = sqlite3.Row
     rows = conn.execute(
@@ -196,11 +218,11 @@ def cmd_recall_issues(args: argparse.Namespace) -> None:
              AND session_id IN (
                SELECT s.id FROM session_files sf
                JOIN sessions s ON sf.session_id = s.id
-               WHERE sf.file_path LIKE ?
+               WHERE sf.file_path LIKE ? ESCAPE '\\'
                ORDER BY s.created_at DESC LIMIT 10
              )
            LIMIT 10""",
-        (f"%{args.pattern}%",),
+        (f"%{escaped}%",),
     ).fetchall()
     print_table(rows, ["hit", "session_id", "source_type"])
 

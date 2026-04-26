@@ -17,10 +17,9 @@ import sqlite3
 import sys
 from pathlib import Path
 
-
-def db_path() -> Path:
-    raw = os.environ.get("ANVIL_DB_PATH", "~/.claude-anvil/anvil.db")
-    return Path(os.path.expanduser(os.path.expandvars(raw)))
+_SCRIPT_DIR = Path(__file__).resolve().parent
+sys.path.insert(0, str(_SCRIPT_DIR))
+from anvil_shared import db_path  # noqa: E402
 
 
 def main() -> int:
@@ -46,9 +45,19 @@ def main() -> int:
 
     try:
         conn = sqlite3.connect(str(path), timeout=2.0)
-        row = conn.execute(
-            "SELECT id FROM sessions WHERE ended_at IS NULL ORDER BY id DESC LIMIT 1"
-        ).fetchone()
+        session_id_env = os.environ.get("ANVIL_SESSION_ID", "").strip()
+        try:
+            sid = int(session_id_env) if session_id_env else None
+        except ValueError:
+            sid = None
+        if sid is not None:
+            row = conn.execute(
+                "SELECT id FROM sessions WHERE id = ?", (sid,)
+            ).fetchone()
+        else:
+            row = conn.execute(
+                "SELECT id FROM sessions WHERE ended_at IS NULL ORDER BY id DESC LIMIT 1"
+            ).fetchone()
         if not row:
             return 0
         session_id = row[0]
