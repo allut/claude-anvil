@@ -126,13 +126,10 @@ The raw DB is at `~/.claude-anvil/anvil.db`. Open it with any SQLite browser.
 
 - **`EPERM: operation not permitted, rename … allut-claude-anvil → allut-claude-anvil.bak`** (Windows) — Claude Code backs up the old plugin directory before updating it. Windows blocks the rename if any process holds a handle to a file inside that directory (common culprits: Windows Defender real-time scanning, Windows Explorer, or Claude Code itself). Fix:
   1. Exit Claude Code completely.
-  2. Open PowerShell and run:
-     ```powershell
-     Remove-Item -Recurse -Force "$env:USERPROFILE\.claude\plugins\marketplaces\allut-claude-anvil","$env:USERPROFILE\.claude\plugins\marketplaces\allut-claude-anvil.bak" -ErrorAction SilentlyContinue
-     ```
+  2. Double-click `plugin/scripts/fix-windows-plugin.bat` (or run it from any terminal — no PowerShell execution policy change required). It removes the stale plugin directories and prints a confirmation.
   3. Reopen Claude Code and run `/plugin marketplace add allut/claude-anvil` again.
-  
-  To prevent recurrence, add `%USERPROFILE%\.claude\plugins` to Windows Defender's exclusion list (*Windows Security → Virus & threat protection → Manage settings → Exclusions*). A ready-made cleanup script is at `plugin/scripts/fix-windows-plugin.bat` (double-click or run from any terminal — no PowerShell execution policy change required).
+
+  To prevent recurrence, add `%USERPROFILE%\.claude\plugins` to Windows Defender's exclusion list (*Windows Security → Virus & threat protection → Manage settings → Exclusions*).
 
 - **`anvil-ledger.py: schema missing`** — run `python scripts/anvil-ledger.py init` from the plugin directory so the script can resolve `sql/schema.sql`.
 - **"Ollama unreachable"** — is the daemon running? `curl http://localhost:11434/api/tags`.
