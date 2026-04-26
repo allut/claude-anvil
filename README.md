@@ -136,7 +136,7 @@ The raw DB is at `~/.claude-anvil/anvil.db`. Open it with any SQLite browser.
 
 - **`anvil-ledger.py: schema missing`** — run `python scripts/anvil-ledger.py init` from the plugin directory so the script can resolve `sql/schema.sql`.
 - **"Ollama unreachable"** — is the daemon running? `curl http://localhost:11434/api/tags`.
-- **Gemini 400 / 403** — the free tier throttles or the selected model may be unavailable in your region. Re-run `/anvil-setup` and pick a different Gemini model (e.g. `gemini-2.5-flash`) from the wizard's model list.
+- **Gemini 429 / quota exceeded** — the default `gemini-2.5-flash` gives 1,500 req/day free. If you're still hitting limits, re-run `/anvil-setup` and generate a new API key at https://aistudio.google.com/apikey, or switch to a different reviewer.
 - **Reviewer returned "concern: no parseable verdict"** — the model ignored the JSON-only instruction. Happens occasionally with smaller/older models; `anvil-review.py` attempts to extract the first JSON object from the reply and falls back to `concern` if that fails.
 - **PostToolUse hook isn't tracking edits** — the hook only runs while an anvil session is open (`sessions.ended_at IS NULL`). If `/anvil` crashed partway through, run `python scripts/anvil-ledger.py end-session <id> "crashed"` to close it.
 

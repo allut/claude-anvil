@@ -69,7 +69,7 @@ python "${CLAUDE_PLUGIN_ROOT}/scripts/anvil-config.py" read 2>/dev/null
 ```
 If `read` exits non-zero (no existing config), use this default skeleton:
 ```json
-{"version":1,"setup_completed":"","reviewers":{"claude":{"enabled":false,"model":"sonnet"},"openai":{"enabled":false,"endpoint":"https://api.openai.com/v1/chat/completions","api_key":"","model":"gpt-4o","json_mode":"on"},"gemini":{"enabled":false,"api_key":"","model":"gemini-2.5-pro","endpoint":""},"ollama":{"enabled":false,"host":"http://localhost:11434","model":"qwen2.5-coder:7b"}},"roster":{"medium":["claude"],"large":["claude","gemini","ollama"]}}
+{"version":1,"setup_completed":"","reviewers":{"claude":{"enabled":false,"model":"sonnet"},"openai":{"enabled":false,"endpoint":"https://api.openai.com/v1/chat/completions","api_key":"","model":"gpt-4o","json_mode":"on"},"gemini":{"enabled":false,"api_key":"","model":"gemini-2.5-flash","endpoint":""},"ollama":{"enabled":false,"host":"http://localhost:11434","model":"qwen2.5-coder:7b"}},"roster":{"medium":["claude"],"large":["claude","gemini","ollama"]}}
 ```
 
 For each reviewer in `$ENABLED`, run the matching block. Set `reviewers.<name>.enabled = true`; set `enabled = false` for any not selected.
@@ -121,8 +121,8 @@ If `off`: `set openai json_mode=off`.
 #### 3c. Gemini
 
 `AskUserQuestion` "Pick the Gemini model":
-- `gemini-2.5-pro` (default, deepest)
-- `gemini-2.5-flash` (faster, cheaper-tier rate limits)
+- `gemini-2.5-flash` (default, higher free-tier quota: 1,500 req/day)
+- `gemini-2.5-pro` (deeper analysis, lower free-tier quota: 50 req/day)
 
 `AskUserQuestion` "Ready to enter your Gemini API key?":
 - `Yes — open the key dialog` — A password-masked dialog box will appear. The key never appears in the conversation.

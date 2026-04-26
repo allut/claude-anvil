@@ -264,7 +264,7 @@ def call_openai(diff: str, truncated: bool) -> tuple[dict, str]:
 
 def call_gemini(diff: str, truncated: bool) -> tuple[dict, str]:
     api_key = _setting("gemini", "api_key", "ANVIL_GEMINI_API_KEY", "")
-    model = _setting("gemini", "model", "ANVIL_GEMINI_MODEL", "gemini-2.5-pro")
+    model = _setting("gemini", "model", "ANVIL_GEMINI_MODEL", "gemini-2.5-flash")
     endpoint = _setting(
         "gemini", "endpoint", "ANVIL_GEMINI_ENDPOINT",
         f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent",

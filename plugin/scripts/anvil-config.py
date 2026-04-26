@@ -11,7 +11,7 @@ Schema (version 1):
         "claude": {"enabled": true,  "model": "sonnet"},
         "openai": {"enabled": false, "endpoint": "...", "api_key": "",
                     "model": "gpt-4o", "json_mode": "on"},
-        "gemini": {"enabled": false, "api_key": "", "model": "gemini-2.5-pro",
+        "gemini": {"enabled": false, "api_key": "", "model": "gemini-2.5-flash",
                     "endpoint": ""},
         "ollama": {"enabled": false, "host": "http://localhost:11434",
                     "model": "qwen2.5-coder:7b"}
@@ -96,7 +96,7 @@ def default_config() -> dict[str, Any]:
             "gemini": {
                 "enabled": False,
                 "api_key": "",
-                "model": "gemini-2.5-pro",
+                "model": "gemini-2.5-flash",
                 "endpoint": "",
             },
             "ollama": {
@@ -422,7 +422,7 @@ def validate_openai() -> dict[str, str]:
 
 def validate_gemini() -> dict[str, str]:
     api_key = resolve_value("gemini", "api_key", None, "")
-    model = resolve_value("gemini", "model", None, "gemini-2.5-pro")
+    model = resolve_value("gemini", "model", None, "gemini-2.5-flash")
     if not api_key:
         return {"status": "unauthorized", "detail": "ANVIL_GEMINI_API_KEY / config.api_key is empty"}
     url = f"https://generativelanguage.googleapis.com/v1beta/models?key={api_key}"
