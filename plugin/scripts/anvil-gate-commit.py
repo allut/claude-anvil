@@ -85,9 +85,15 @@ def main() -> int:
                 "SELECT id, task_id FROM sessions WHERE id = ?", (sid,)
             ).fetchone()
         else:
+            # Only consider sessions that have at least one baseline check;
+            # sessions with zero evidence (e.g. throwaway test sessions) are
+            # invisible to the gate so they cannot spuriously block commits.
             row = conn.execute(
-                "SELECT id, task_id FROM sessions WHERE ended_at IS NULL "
-                "ORDER BY id DESC LIMIT 1"
+                "SELECT s.id, s.task_id "
+                "FROM sessions s "
+                "JOIN anvil_checks c ON c.session_id = s.id AND c.phase = 'baseline' "
+                "WHERE s.ended_at IS NULL "
+                "ORDER BY s.id DESC LIMIT 1"
             ).fetchone()
         if not row:
             return 0

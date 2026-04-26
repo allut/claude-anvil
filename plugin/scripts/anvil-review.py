@@ -35,6 +35,7 @@ import argparse
 import json
 import os
 import re
+import subprocess
 import sys
 import tempfile
 import urllib.error
@@ -55,6 +56,28 @@ def _config_path() -> Path:
     return Path(os.path.expanduser(os.path.expandvars(raw)))
 
 
+def _dpapi_decrypt(blob: str) -> str | None:
+    """Decrypt a 'dpapi:<base64>' blob via PowerShell (Windows only)."""
+    b64 = blob[6:]
+    ps = (
+        "Add-Type -AssemblyName System.Security;"
+        f"$c=[Convert]::FromBase64String('{b64}');"
+        "$p=[System.Security.Cryptography.ProtectedData]::Unprotect($c,$null,'CurrentUser');"
+        "[Convert]::ToBase64String($p)"
+    )
+    try:
+        r = subprocess.run(
+            ["powershell", "-NoProfile", "-Command", ps],
+            capture_output=True, timeout=15,
+        )
+        if r.returncode != 0:
+            return None
+        import base64 as _b64
+        return _b64.b64decode(r.stdout.decode().strip()).decode()
+    except Exception:
+        return None
+
+
 def _config_value(provider: str, key: str, default: str = "") -> str:
     global _CONFIG_CACHE, _CONFIG_LOADED
     if not _CONFIG_LOADED:
@@ -67,7 +90,13 @@ def _config_value(provider: str, key: str, default: str = "") -> str:
         return default
     block = (_CONFIG_CACHE.get("reviewers") or {}).get(provider) or {}
     val = block.get(key)
-    return str(val) if val not in (None, "") else default
+    if val in (None, ""):
+        return default
+    val = str(val)
+    if val.startswith("dpapi:"):
+        decrypted = _dpapi_decrypt(val)
+        return decrypted if decrypted else default
+    return val
 
 
 def _setting(provider: str, key: str, env_var: str, default: str = "") -> str:
@@ -119,6 +148,16 @@ def build_user_prompt(diff: str, truncated: bool) -> str:
     return f"{note}Staged diff:\n\n```diff\n{diff}\n```"
 
 
+def _fix_escapes(text: str) -> str:
+    r"""Replace invalid JSON escape sequences (e.g. \%, \_) with the bare character.
+
+    Valid JSON escapes: \" \\ \/ \b \f \n \r \t \uXXXX.
+    LLMs sometimes emit \% or \_ inside code snippets in JSON strings; those
+    cause json.loads to raise JSONDecodeError even when the structure is fine.
+    """
+    return re.sub(r'\\([^"\\/bfnrtu])', r'\1', text)
+
+
 def extract_json(text: str) -> dict | None:
     """Pull the first JSON object out of a model reply, tolerating markdown fences."""
     if not text:
@@ -130,6 +169,11 @@ def extract_json(text: str) -> dict | None:
         stripped = fence.group(1).strip()
     try:
         return json.loads(stripped)
+    except json.JSONDecodeError:
+        pass
+    # Retry after sanitizing invalid escape sequences emitted by some models.
+    try:
+        return json.loads(_fix_escapes(stripped))
     except json.JSONDecodeError:
         pass
     # Fall back: first balanced {...} substring.
@@ -147,7 +191,10 @@ def extract_json(text: str) -> dict | None:
                 try:
                     return json.loads(candidate)
                 except json.JSONDecodeError:
-                    start = -1
+                    try:
+                        return json.loads(_fix_escapes(candidate))
+                    except json.JSONDecodeError:
+                        start = -1
     return None
 
 
@@ -295,6 +342,8 @@ def main(argv: list[str] | None = None) -> int:
             body = ""
         if e.code in (401, 403):
             error = f"{args.provider} authentication failed (HTTP {e.code}): {body}"
+        elif e.code == 400:
+            error = f"{args.provider} bad request (HTTP 400) — check model name or request body format: {body}"
         else:
             error = f"{args.provider} HTTP {e.code} {e.reason}: {body}"
     except (urllib.error.URLError, TimeoutError, ConnectionError) as e:
