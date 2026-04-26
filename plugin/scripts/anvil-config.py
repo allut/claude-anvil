@@ -626,26 +626,119 @@ def cmd_prompt_key(args: argparse.Namespace) -> int:
     return 0
 
 
+def _gui_key_dialog(provider: str) -> str:
+    """Show a custom modal Tkinter password dialog. Returns the entered key or ''."""
+    try:
+        import tkinter as tk
+    except ImportError:
+        return ""
+
+    BG          = "#f5f5f7"
+    HEADER_BG   = "#1c1c2e"
+    HEADER_FG   = "#ffffff"
+    SUBTITLE_FG = "#a0a0b0"
+    ACCENT      = "#4f8ef7"
+    ACCENT_FG   = "#ffffff"
+    ACCENT_HOV  = "#3a7ae8"
+    CANCEL_BG   = "#e0e0e6"
+    CANCEL_FG   = "#333333"
+    ENTRY_BG    = "#ffffff"
+    ENTRY_FG    = "#1a1a2e"
+
+    result: list[str] = [""]
+
+    root = tk.Tk()
+    root.withdraw()
+
+    dlg = tk.Toplevel(root)
+    dlg.title("Anvil — API Key Setup")
+    dlg.resizable(False, False)
+    dlg.configure(bg=BG)
+    dlg.attributes("-topmost", True)
+
+    header = tk.Frame(dlg, bg=HEADER_BG, pady=18)
+    header.pack(fill="x")
+    tk.Label(header, text=provider.capitalize(), bg=HEADER_BG, fg=HEADER_FG,
+             font=("Segoe UI", 18, "bold")).pack()
+    tk.Label(header, text="API Key Required", bg=HEADER_BG, fg=SUBTITLE_FG,
+             font=("Segoe UI", 9)).pack(pady=(2, 0))
+
+    body = tk.Frame(dlg, bg=BG, padx=28, pady=20)
+    body.pack(fill="both")
+    tk.Label(body, text=f"Enter your {provider.capitalize()} API key:",
+             bg=BG, fg="#555566", font=("Segoe UI", 9), anchor="w").pack(fill="x", pady=(0, 6))
+
+    entry_row = tk.Frame(body, bg=BG)
+    entry_row.pack(fill="x")
+
+    entry_var = tk.StringVar()
+    entry = tk.Entry(entry_row, textvariable=entry_var, show="*",
+                     bg=ENTRY_BG, fg=ENTRY_FG, font=("Segoe UI", 10),
+                     relief="flat", bd=0, highlightthickness=1,
+                     highlightbackground="#c8c8d0", highlightcolor=ACCENT, width=34)
+    entry.pack(side="left", ipady=6)
+    entry.focus_set()
+
+    _showing: list[bool] = [False]
+
+    def _toggle_show() -> None:
+        _showing[0] = not _showing[0]
+        entry.config(show="" if _showing[0] else "*")
+        toggle_btn.config(text="Hide" if _showing[0] else "Show")
+
+    toggle_btn = tk.Button(entry_row, text="Show", command=_toggle_show,
+                           bg=CANCEL_BG, fg=CANCEL_FG, font=("Segoe UI", 8),
+                           relief="flat", cursor="hand2", padx=8, pady=4, bd=0)
+    toggle_btn.pack(side="left", padx=(6, 0))
+
+    btn_row = tk.Frame(dlg, bg=BG, padx=28, pady=(4, 20))
+    btn_row.pack(fill="x")
+
+    def _confirm(event=None) -> None:
+        result[0] = entry_var.get()
+        dlg.destroy()
+
+    def _cancel(event=None) -> None:
+        result[0] = ""
+        dlg.destroy()
+
+    cancel_btn = tk.Button(btn_row, text="Cancel", command=_cancel,
+                           bg=CANCEL_BG, fg=CANCEL_FG, font=("Segoe UI", 9),
+                           relief="flat", cursor="hand2", padx=14, pady=6, bd=0)
+    cancel_btn.pack(side="right", padx=(6, 0))
+
+    ok_btn = tk.Button(btn_row, text="OK", command=_confirm,
+                       bg=ACCENT, fg=ACCENT_FG, font=("Segoe UI", 9, "bold"),
+                       relief="flat", cursor="hand2", padx=20, pady=6, bd=0,
+                       activebackground=ACCENT_HOV, activeforeground=ACCENT_FG)
+    ok_btn.pack(side="right")
+    ok_btn.bind("<Enter>", lambda e: ok_btn.config(bg=ACCENT_HOV))
+    ok_btn.bind("<Leave>", lambda e: ok_btn.config(bg=ACCENT))
+
+    dlg.bind("<Return>", _confirm)
+    dlg.bind("<KP_Enter>", _confirm)
+    dlg.bind("<Escape>", _cancel)
+    dlg.protocol("WM_DELETE_WINDOW", _cancel)
+
+    dlg.update_idletasks()
+    w, h = dlg.winfo_reqwidth(), dlg.winfo_reqheight()
+    sw, sh = dlg.winfo_screenwidth(), dlg.winfo_screenheight()
+    dlg.geometry(f"+{(sw - w) // 2}+{(sh - h) // 2}")
+
+    dlg.grab_set()
+    root.wait_window(dlg)
+    root.destroy()
+    return result[0]
+
+
 def cmd_gui_key(args: argparse.Namespace) -> int:
     """Collect an API key via GUI dialog (no TTY needed). Falls back to getpass, then stdin."""
     provider = args.provider
     key = ""
 
-    # Try tkinter password dialog first — works on Windows/macOS/Linux with a display,
-    # no terminal attachment required.
+    # Try custom Tkinter dialog first — works on Windows/macOS/Linux with a display.
     try:
-        import tkinter as tk
-        from tkinter import simpledialog
-        root = tk.Tk()
-        root.withdraw()
-        root.attributes("-topmost", True)
-        key = simpledialog.askstring(
-            "API Key Required",
-            f"Enter your {provider} API key:",
-            show="*",
-            parent=root,
-        ) or ""
-        root.destroy()
+        key = _gui_key_dialog(provider)
     except Exception:
         # Fall back to getpass (needs a real TTY)
         try:
