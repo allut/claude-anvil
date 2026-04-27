@@ -24,10 +24,9 @@ Usage:
 Output:
     - Stdout: one line, e.g. "reviewer=openai verdict=pass findings=0 model=gpt-4o"
     - File:   the full JSON verdict (plus metadata) at --out
-    - Exit 0 if we got a verdict (even "concern" / "fail" ones).
-    - Exit 1 if the provider was unreachable or misconfigured. A stub verdict
-      ({"verdict": "concern", "summary": "<reason>"}) is still written so the
-      /anvil loop can record that the reviewer didn't produce a real signal.
+    - Exit 0 always when a verdict file was written (real or stub).
+    - Exit 2 if the diff file is missing (no verdict can be produced).
+    Callers distinguish real from stub verdicts via the "error" field in the JSON output.
 """
 from __future__ import annotations
 
@@ -42,99 +41,36 @@ import urllib.error
 import urllib.request
 from pathlib import Path
 
-# --- config.json fallback ----------------------------------------------------
-# Env vars always win. If an env var is unset, fall back to whichever value
-# was written by the /anvil-setup wizard at ~/.claude-anvil/config.json.
-# Read once per process to keep call_* hot paths cheap.
-
-_CONFIG_CACHE: dict | None = None
-_CONFIG_LOADED = False
-
-
-def _config_path() -> Path:
-    raw = os.environ.get("ANVIL_CONFIG_PATH", "~/.claude-anvil/config.json")
-    return Path(os.path.expanduser(os.path.expandvars(raw)))
-
-
-def _keychain_read(key_id: str) -> str | None:
-    """Read a key from the OS keychain (macOS via security CLI, Linux via secret-tool).
-    Returns None on Windows — DPAPI handles key storage there, not the keychain sentinel.
-    """
-    if sys.platform == "win32":
-        return None
-    if sys.platform == "darwin":
-        try:
-            r = subprocess.run(
-                ["security", "find-generic-password", "-s", "anvil", "-a", key_id, "-w"],
-                capture_output=True, timeout=10,
-            )
-            return r.stdout.decode().strip() if r.returncode == 0 else None
-        except Exception:
-            return None
-    else:
-        try:
-            r = subprocess.run(
-                ["secret-tool", "lookup", "service", "anvil", "key", key_id],
-                capture_output=True, timeout=10,
-            )
-            return r.stdout.decode().strip() if r.returncode == 0 else None
-        except Exception:
-            return None
-
-
-def _dpapi_decrypt(blob: str) -> str | None:
-    """Decrypt a 'dpapi:<base64>' blob via PowerShell (Windows only)."""
-    b64 = blob[6:]
-    if not re.fullmatch(r"[A-Za-z0-9+/=]+", b64):
-        return None
-    ps = (
-        "Add-Type -AssemblyName System.Security;"
-        f"$c=[Convert]::FromBase64String('{b64}');"
-        "$p=[System.Security.Cryptography.ProtectedData]::Unprotect($c,$null,'CurrentUser');"
-        "[Convert]::ToBase64String($p)"
-    )
-    try:
-        r = subprocess.run(
-            ["powershell", "-NoProfile", "-Command", ps],
-            capture_output=True, timeout=15,
-        )
-        if r.returncode != 0:
-            return None
-        import base64 as _b64
-        return _b64.b64decode(r.stdout.decode().strip()).decode()
-    except Exception:
-        return None
-
-
-def _config_value(provider: str, key: str, default: str = "") -> str:
-    global _CONFIG_CACHE, _CONFIG_LOADED
-    if not _CONFIG_LOADED:
-        _CONFIG_LOADED = True
-        try:
-            _CONFIG_CACHE = json.loads(_config_path().read_text(encoding="utf-8"))
-        except (OSError, json.JSONDecodeError):
-            _CONFIG_CACHE = None
-    if not _CONFIG_CACHE:
-        return default
-    block = (_CONFIG_CACHE.get("reviewers") or {}).get(provider) or {}
-    val = block.get(key)
-    if val in (None, ""):
-        return default
-    val = str(val)
-    if val == "keychain":
-        resolved = _keychain_read(f"anvil-{provider}-api-key")
-        return resolved if resolved else default
-    if val.startswith("dpapi:"):
-        decrypted = _dpapi_decrypt(val)
-        return decrypted if decrypted else default
-    return val
+_SCRIPT_DIR = Path(__file__).resolve().parent
+_SETTING_CACHE: dict[tuple[str, str], str] = {}  # (provider, key) → resolved value; avoids repeated subprocess launches
 
 
 def _setting(provider: str, key: str, env_var: str, default: str = "") -> str:
+    """Resolve a config value: env var → anvil-config.py (keychain/DPAPI/config) → default.
+    default must be a single-line string (stdout is taken line-by-line; embedded newlines would produce garbage).
+    Results are cached per (provider, key) to avoid spawning a subprocess for every call site."""
     v = os.environ.get(env_var)
     if v not in (None, ""):
         return v
-    return _config_value(provider, key, default)
+    cache_key = (provider, key)
+    if cache_key in _SETTING_CACHE:
+        return _SETTING_CACHE[cache_key]
+    script = _SCRIPT_DIR / "anvil-config.py"
+    try:
+        r = subprocess.run(
+            [sys.executable, str(script), "get", provider, key,
+             "--env-var", env_var, "--default", default],
+            capture_output=True, timeout=20, text=True,  # >15s to outlast DPAPI's inner PowerShell timeout
+        )
+        if r.returncode == 0:
+            # Take only the last non-empty line so any future startup warnings don't corrupt the value.
+            lines = [ln for ln in r.stdout.splitlines() if ln.strip()]
+            result = lines[-1].strip() if lines else default
+            _SETTING_CACHE[cache_key] = result
+            return result
+    except Exception:
+        pass
+    return default
 
 SHARED_PROMPT = (
     "You are a senior code reviewer performing an adversarial review.\n"
@@ -400,7 +336,7 @@ def main(argv: list[str] | None = None) -> int:
         f"findings={len(record['findings'])} model={model or 'unknown'} "
         f"out={out_path}"
     )
-    return 0 if error is None else 1
+    return 0
 
 
 if __name__ == "__main__":
