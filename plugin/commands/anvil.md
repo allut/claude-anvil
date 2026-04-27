@@ -283,9 +283,11 @@ Spawn the `code-review-claude` subagent with this prompt:
 **External reviewer calls (Bash, run in parallel with the Task call):**
 
 ```bash
-python "${CLAUDE_PLUGIN_ROOT}/scripts/anvil-review.py" --provider gemini --task-id "$TASK_ID" --diff-file /tmp/anvil-diff-"$TASK_ID".patch
-python "${CLAUDE_PLUGIN_ROOT}/scripts/anvil-review.py" --provider ollama --task-id "$TASK_ID" --diff-file /tmp/anvil-diff-"$TASK_ID".patch
-python "${CLAUDE_PLUGIN_ROOT}/scripts/anvil-review.py" --provider openai --task-id "$TASK_ID" --diff-file /tmp/anvil-diff-"$TASK_ID".patch
+# anvil-review.py exits 0 on all provider errors (stub verdict written); || true suppresses all non-zero exits including
+# exit 2 (diff file missing) — the /anvil loop reads the JSON "error" field to detect stub verdicts rather than relying on exit code
+python "${CLAUDE_PLUGIN_ROOT}/scripts/anvil-review.py" --provider gemini --task-id "$TASK_ID" --diff-file /tmp/anvil-diff-"$TASK_ID".patch || true
+python "${CLAUDE_PLUGIN_ROOT}/scripts/anvil-review.py" --provider ollama --task-id "$TASK_ID" --diff-file /tmp/anvil-diff-"$TASK_ID".patch || true
+python "${CLAUDE_PLUGIN_ROOT}/scripts/anvil-review.py" --provider openai --task-id "$TASK_ID" --diff-file /tmp/anvil-diff-"$TASK_ID".patch || true
 ```
 
 After each reviewer finishes, read its JSON verdict and INSERT into the ledger:
