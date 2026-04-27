@@ -248,6 +248,8 @@ def _dpapi_decrypt(encoded: str) -> str | None:
     if not encoded.startswith("dpapi:"):
         return None
     b64_cipher = encoded[6:]
+    if not re.fullmatch(r"[A-Za-z0-9+/=]+", b64_cipher):
+        return None
     ps = (
         "Add-Type -AssemblyName System.Security;"
         f"$c=[Convert]::FromBase64String('{b64_cipher}');"
