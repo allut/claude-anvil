@@ -82,27 +82,33 @@ def main() -> int:
             sid = None
         if sid is not None:
             row = conn.execute(
-                "SELECT id, task_id FROM sessions WHERE id = ?", (sid,)
+                "SELECT id, task_id, created_at FROM sessions WHERE id = ?", (sid,)
             ).fetchone()
         else:
             # Only consider sessions that have at least one baseline check;
             # sessions with zero evidence (e.g. throwaway test sessions) are
             # invisible to the gate so they cannot spuriously block commits.
+            # anvil_checks has no session_id column — join via task_id instead.
             row = conn.execute(
-                "SELECT s.id, s.task_id "
+                "SELECT s.id, s.task_id, s.created_at "
                 "FROM sessions s "
-                "JOIN anvil_checks c ON c.session_id = s.id AND c.phase = 'baseline' "
                 "WHERE s.ended_at IS NULL "
+                "  AND EXISTS ("
+                "    SELECT 1 FROM anvil_checks c "
+                "    WHERE c.task_id = s.task_id AND c.phase = 'baseline'"
+                "      AND c.ts >= s.created_at"
+                "  ) "
                 "ORDER BY s.id DESC LIMIT 1"
             ).fetchone()
         if not row:
             return 0
-        session_id, task_id = row
+        session_id, task_id, session_created_at = row
         counts = {}
         for phase in ("baseline", "after", "review"):
             (n,) = conn.execute(
-                "SELECT COUNT(*) FROM anvil_checks WHERE task_id = ? AND phase = ?",
-                (task_id, phase),
+                "SELECT COUNT(*) FROM anvil_checks "
+                "WHERE task_id = ? AND phase = ? AND ts >= ?",
+                (task_id, phase, session_created_at),
             ).fetchone()
             counts[phase] = n
     except sqlite3.Error as e:

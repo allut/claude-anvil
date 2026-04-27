@@ -56,9 +56,37 @@ def _config_path() -> Path:
     return Path(os.path.expanduser(os.path.expandvars(raw)))
 
 
+def _keychain_read(key_id: str) -> str | None:
+    """Read a key from the OS keychain (macOS via security CLI, Linux via secret-tool).
+    Returns None on Windows — DPAPI handles key storage there, not the keychain sentinel.
+    """
+    if sys.platform == "win32":
+        return None
+    if sys.platform == "darwin":
+        try:
+            r = subprocess.run(
+                ["security", "find-generic-password", "-s", "anvil", "-a", key_id, "-w"],
+                capture_output=True, timeout=10,
+            )
+            return r.stdout.decode().strip() if r.returncode == 0 else None
+        except Exception:
+            return None
+    else:
+        try:
+            r = subprocess.run(
+                ["secret-tool", "lookup", "service", "anvil", "key", key_id],
+                capture_output=True, timeout=10,
+            )
+            return r.stdout.decode().strip() if r.returncode == 0 else None
+        except Exception:
+            return None
+
+
 def _dpapi_decrypt(blob: str) -> str | None:
     """Decrypt a 'dpapi:<base64>' blob via PowerShell (Windows only)."""
     b64 = blob[6:]
+    if not re.fullmatch(r"[A-Za-z0-9+/=]+", b64):
+        return None
     ps = (
         "Add-Type -AssemblyName System.Security;"
         f"$c=[Convert]::FromBase64String('{b64}');"
@@ -93,6 +121,9 @@ def _config_value(provider: str, key: str, default: str = "") -> str:
     if val in (None, ""):
         return default
     val = str(val)
+    if val == "keychain":
+        resolved = _keychain_read(f"anvil-{provider}-api-key")
+        return resolved if resolved else default
     if val.startswith("dpapi:"):
         decrypted = _dpapi_decrypt(val)
         return decrypted if decrypted else default
@@ -271,13 +302,12 @@ def call_gemini(diff: str, truncated: bool) -> tuple[dict, str]:
     )
     if not api_key:
         raise RuntimeError("ANVIL_GEMINI_API_KEY is not set")
-    url = f"{endpoint}?key={api_key}"
     payload = {
         "systemInstruction": {"parts": [{"text": SHARED_PROMPT}]},
         "contents": [{"role": "user", "parts": [{"text": build_user_prompt(diff, truncated)}]}],
         "generationConfig": {"temperature": 0.2, "responseMimeType": "application/json"},
     }
-    data = http_post_json(url, payload, {})
+    data = http_post_json(endpoint, payload, {"x-goog-api-key": api_key})
     parts = data.get("candidates", [{}])[0].get("content", {}).get("parts", [])
     content = "".join(p.get("text", "") for p in parts)
     return extract_json(content) or {}, model
