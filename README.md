@@ -57,8 +57,19 @@ Run `/anvil-setup` from any Claude Code session. The wizard will:
 - Collect API keys, validate each with a small live request, and write them to `~/.claude-anvil/config.json` (chmod `0600` on POSIX).
 - Pick the Claude reviewer's model (`sonnet` / `haiku` / `opus`).
 - Offer to `ollama pull` if Ollama is enabled and the model isn't pulled yet.
+- Optionally create bare shortcuts so you can type `/anvil` instead of `/claude-anvil:anvil` (see below).
 
 You can re-run `/anvil-setup` any time to reconfigure, or `/anvil-setup reset` to wipe and start over.
+
+### Bare command shortcuts (optional)
+
+The wizard's final step offers to write `~/.claude/commands/anvil.md` and `~/.claude/commands/anvil-setup.md`, which expose the commands without the plugin namespace prefix. After accepting, you can use `/anvil` and `/anvil-setup` directly in any conversation.
+
+Re-running `/anvil-setup` refreshes the shortcuts when the plugin updates. To create them manually:
+
+```bash
+python "${CLAUDE_PLUGIN_ROOT}/scripts/anvil-config.py" create-shortcuts "${CLAUDE_PLUGIN_ROOT}"
+```
 
 ### Reviewer options
 

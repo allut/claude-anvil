@@ -38,6 +38,8 @@ plugin/
 
 - `~/.claude-anvil/config.json` — reviewer config; written by `anvil-config.py save`
 - `~/.claude-anvil/anvil.db` — SQLite ledger; override with `$ANVIL_DB_PATH`
+- `~/.claude-anvil/plugin-root` — junction/symlink created by `create-shortcuts`; points to the installed plugin directory
+- `~/.claude/commands/anvil.md` and `anvil-setup.md` — bare shortcuts written by `create-shortcuts`
 - `/tmp/anvil-diff-<task_id>.patch` — staged diff snapshot used by reviewers
 - `/tmp/anvil-review-<provider>-<task_id>.json` — per-reviewer JSON verdicts
 
@@ -79,6 +81,9 @@ python plugin/scripts/anvil-config.py summary
 
 # Check keychain storage
 python plugin/scripts/anvil-config.py keychain-status
+
+# Create bare /anvil and /anvil-setup shortcuts in ~/.claude/commands/
+python plugin/scripts/anvil-config.py create-shortcuts "${CLAUDE_PLUGIN_ROOT}"
 
 # Initialize / upgrade ledger schema
 python plugin/scripts/anvil-ledger.py init
