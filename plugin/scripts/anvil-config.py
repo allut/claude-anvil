@@ -45,6 +45,9 @@ Subcommands:
     summary                             -> human-readable masked summary
     keychain-status                     -> shows which backend is active and where each key lives
     keychain-delete PROVIDER            -> removes keychain entry for a provider's api_key
+    create-shortcuts PLUGIN_ROOT        -> writes ~/.claude/commands/anvil.md and anvil-setup.md
+                                           with ${CLAUDE_PLUGIN_ROOT} replaced by a stable symlink;
+                                           also creates ~/.claude-anvil/plugin-root junction/symlink
 """
 from __future__ import annotations
 
@@ -854,6 +857,88 @@ def cmd_keychain_delete(args: argparse.Namespace) -> int:
     return 0
 
 
+_CONTEXT7_TOOLS = {
+    "mcp__plugin_claude-anvil_context7__resolve-library-id",
+    "mcp__plugin_claude-anvil_context7__query-docs",
+}
+
+# Matches the allowed-tools frontmatter line, e.g.:
+#   allowed-tools: Bash, Read, mcp__plugin_claude-anvil_context7__query-docs, Task
+_ALLOWED_TOOLS_RE = re.compile(r"^(allowed-tools:\s*)(.+)$", re.MULTILINE)
+
+
+def _strip_context7_tools(content: str) -> str:
+    def _replace(m: re.Match) -> str:
+        prefix = m.group(1)
+        tools = [t.strip() for t in m.group(2).split(",")]
+        filtered = [t for t in tools if t not in _CONTEXT7_TOOLS]
+        if not filtered:
+            return m.group(0)  # preserve original line rather than emit empty allowed-tools
+        return prefix + ", ".join(filtered)
+    return _ALLOWED_TOOLS_RE.sub(_replace, content)
+
+
+def cmd_create_shortcuts(args: argparse.Namespace) -> int:
+    plugin_root = Path(args.plugin_root).resolve()
+    stable_link = Path(os.path.expanduser("~/.claude-anvil/plugin-root"))
+    commands_dir = Path(os.path.expanduser("~/.claude/commands"))
+
+    # --- validate sources before touching the filesystem ---
+    sources: list[tuple[str, Path]] = []
+    for name in ("anvil.md", "anvil-setup.md"):
+        src = plugin_root / "commands" / name
+        if not src.exists():
+            print(f"anvil-config: source not found: {src}", file=sys.stderr)
+            return 1
+        sources.append((name, src))
+
+    # --- create/replace the stable plugin-root junction/symlink ---
+    stable_link.parent.mkdir(parents=True, exist_ok=True)
+    if stable_link.exists() or stable_link.is_symlink():
+        if sys.platform == "win32":
+            # os.rmdir removes a junction without touching the target directory.
+            # We do NOT fall back to shutil.rmtree — that would recursively delete
+            # a real directory if stable_link ever pointed at one.
+            os.rmdir(stable_link)
+        else:
+            stable_link.unlink()
+
+    if sys.platform == "win32":
+        r = subprocess.run(
+            ["cmd", "/c", "mklink", "/J", str(stable_link), str(plugin_root)],
+            capture_output=True, timeout=10,
+        )
+        if r.returncode != 0:
+            print(f"anvil-config: failed to create junction: {r.stderr.decode().strip()}",
+                  file=sys.stderr)
+            return 1
+    else:
+        stable_link.symlink_to(plugin_root)
+
+    # Forward slashes are intentional: paths are embedded in bash script bodies
+    # inside the .md files and bash (including Git Bash on Windows) requires them.
+    stable_link_str = stable_link.as_posix()
+
+    # --- generate the two command files atomically ---
+    commands_dir.mkdir(parents=True, exist_ok=True)
+
+    created: list[str] = []
+    for name, src in sources:
+        content = src.read_text(encoding="utf-8")
+        content = content.replace("${CLAUDE_PLUGIN_ROOT}", stable_link_str)
+        if name == "anvil.md":
+            content = _strip_context7_tools(content)
+        dest = commands_dir / name
+        atomic_write(dest, content)
+        created.append(str(dest))
+
+    print("Bare shortcuts created:")
+    for path in created:
+        print(f"  {path}")
+    print(f"Plugin-root link: {stable_link} -> {plugin_root}")
+    return 0
+
+
 # --- arg parsing -------------------------------------------------------------
 
 def build_parser() -> argparse.ArgumentParser:
@@ -902,6 +987,11 @@ def build_parser() -> argparse.ArgumentParser:
     gk = sub.add_parser("gui-key")
     gk.add_argument("provider", choices=PROVIDERS)
     gk.set_defaults(func=cmd_gui_key)
+
+    cs = sub.add_parser("create-shortcuts")
+    cs.add_argument("plugin_root", metavar="PLUGIN_ROOT",
+                    help="Absolute path to the plugin root (value of ${CLAUDE_PLUGIN_ROOT})")
+    cs.set_defaults(func=cmd_create_shortcuts)
 
     return p
 

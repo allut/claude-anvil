@@ -224,8 +224,26 @@ Run `python "${CLAUDE_PLUGIN_ROOT}/scripts/anvil-config.py" summary` and present
   > To redo setup later, run `/anvil-setup reset` or `rm ~/.claude-anvil/config.json`.
   > Note: `/anvil-setup reset` also removes any keychain entries. If you delete config.json manually, run `python scripts/anvil-config.py keychain-delete openai` and `keychain-delete gemini` to remove keychain entries too.
 - Key storage hint (show output of `python "${CLAUDE_PLUGIN_ROOT}/scripts/anvil-config.py" keychain-status`).
-- Next-step hint:
+- Next-step hint (shown after Step 9):
   > Try `/anvil <task>` now.
+
+### 9. Create bare command shortcuts (optional)
+
+Ask the user via `AskUserQuestion`:
+
+> "Would you like `/anvil` and `/anvil-setup` as bare commands (no namespace prefix)? This writes two files to `~/.claude/commands/` so you can type `/anvil` instead of `/claude-anvil:anvil`. Re-running this wizard refreshes them if the plugin updates."
+
+Choices:
+- `Yes — create bare shortcuts`
+- `No thanks`
+
+If yes, run:
+
+```bash
+python "${CLAUDE_PLUGIN_ROOT}/scripts/anvil-config.py" create-shortcuts "${CLAUDE_PLUGIN_ROOT}"
+```
+
+Report the full output (which files were created and where the plugin-root link points). Inform the user the bare commands are ready to use immediately in any new conversation.
 
 ## Failure handling
 
