@@ -19,7 +19,7 @@ The user's request is:
 This plugin ships a SQLite verification ledger and a few helper scripts. You interact with them through Bash:
 
 - **Ledger + session memory + learnable facts**: `python "${CLAUDE_PLUGIN_ROOT}/scripts/anvil-ledger.py" <subcommand>` (subcommands: `init`, `insert-check`, `select-bundle`, `count-phase`, `start-session`, `end-session`, `track-edit`, `recall`, `recall-issues`, `memory-set`, `memory-get`, `memory-list`).
-- **External adversarial reviewers** (GPT, Gemini, Ollama): `python "${CLAUDE_PLUGIN_ROOT}/scripts/anvil-review.py" --provider openai|gemini|ollama --task-id TASK_ID --diff-file /tmp/anvil-diff-TASK_ID.patch`. Writes a JSON verdict you then read and INSERT into the ledger.
+- **External adversarial reviewers** (GPT, Gemini, Ollama): `python "${CLAUDE_PLUGIN_ROOT}/scripts/anvil-review.py" --provider openai|gemini|ollama --task-id TASK_ID --diff-file "$ANVIL_TMPDIR/anvil-diff-TASK_ID.patch"`. Writes a JSON verdict you then read and INSERT into the ledger.
 - **Claude adversarial reviewer**: invoke `Task(subagent_type="code-review-claude", ...)` (see 5c below).
 - **IDE diagnostics**: call `mcp__ide__getDiagnostics` directly.
 - **Library docs**: `mcp__plugin_claude-anvil_context7__resolve-library-id` then `mcp__plugin_claude-anvil_context7__query-docs`.
@@ -93,7 +93,7 @@ Every check is an INSERT via:
 python "${CLAUDE_PLUGIN_ROOT}/scripts/anvil-ledger.py" insert-check \
   --task-id "$TASK_ID" --phase baseline|after|review \
   --check "<name>" --tool "<tool>" --command "<command>" \
-  --exit-code <n> --passed 0|1 --output-file /tmp/<output>
+  --exit-code <n> --passed 0|1 --output-file "$ANVIL_TMPDIR/<output>"
 ```
 
 **Rule: Every verification step must be an INSERT. The Evidence Bundle is the output of `select-bundle`, not prose. If the INSERT didn't happen, the verification didn't happen.**
@@ -236,13 +236,13 @@ If Tier 3 is infeasible in the current environment (e.g., iOS library with no si
 
 Pattern for each check (redirect both stdout and stderr to a file so the full output is available):
 ```bash
-npm run build > /tmp/anvil-build.log 2>&1
+npm run build > "$ANVIL_TMPDIR/anvil-build.log" 2>&1
 EXIT=$?
 python "${CLAUDE_PLUGIN_ROOT}/scripts/anvil-ledger.py" insert-check \
   --task-id "$TASK_ID" --phase after \
   --check build --tool npm --command "npm run build" \
   --exit-code "$EXIT" --passed "$([ $EXIT -eq 0 ] && echo 1 || echo 0)" \
-  --output-file /tmp/anvil-build.log
+  --output-file "$ANVIL_TMPDIR/anvil-build.log"
 ```
 
 **After every check**, INSERT into the ledger (Medium and Large only). **If any check fails:** fix and re-run (max 2 attempts). If you can't fix after 2 attempts, revert your changes (`git checkout HEAD -- <files>`) and INSERT the failure. Do NOT leave the user with broken code.
@@ -258,8 +258,9 @@ python "${CLAUDE_PLUGIN_ROOT}/scripts/anvil-ledger.py" insert-check \
 Before launching reviewers, stage your changes and snapshot the diff (reviewers read from this file):
 
 ```bash
+ANVIL_TMPDIR=$(python -c "import tempfile; print(tempfile.gettempdir())") # native Windows path; avoids MSYS2 /tmp translation gap
 git add -A
-git --no-pager diff --staged > /tmp/anvil-diff-"$TASK_ID".patch
+git --no-pager diff --staged > "$ANVIL_TMPDIR/anvil-diff-$TASK_ID.patch"
 ```
 
 **Claude (Task subagent) is the ONLY reviewer you can spawn with a Claude model.** GPT / Gemini / Ollama are each invoked via a Bash call to `anvil-review.py`. Issue `Task` and `Bash` calls in the **same assistant turn** so they run in parallel.
@@ -278,23 +279,25 @@ ANVIL_LARGE=$(python "${CLAUDE_PLUGIN_ROOT}/scripts/anvil-config.py" roster larg
 
 Spawn the `code-review-claude` subagent with this prompt:
 
-> task_id=`<TASK_ID>` diff_file=`/tmp/anvil-diff-<TASK_ID>.patch` out_file=`/tmp/anvil-review-claude-<TASK_ID>.json`. Attack the diff. Find bugs, security issues, logic errors, race conditions, edge cases, missing error handling, and architectural violations. Ignore style. Write strict JSON to out_file per your system prompt, then print one `reviewer=claude ...` summary line.
+> task_id=`<TASK_ID>` diff_file=`<ANVIL_TMPDIR>/anvil-diff-<TASK_ID>.patch` out_file=`<ANVIL_TMPDIR>/anvil-review-claude-<TASK_ID>.json`. Attack the diff. Find bugs, security issues, logic errors, race conditions, edge cases, missing error handling, and architectural violations. Ignore style. Write strict JSON to out_file per your system prompt, then print one `reviewer=claude ...` summary line.
+
+Substitute `<ANVIL_TMPDIR>` with the actual value of `$ANVIL_TMPDIR` resolved above when constructing this prompt.
 
 **External reviewer calls (Bash, run in parallel with the Task call):**
 
 ```bash
 # anvil-review.py exits 0 on all provider errors (stub verdict written); || true suppresses all non-zero exits including
 # exit 2 (diff file missing) — the /anvil loop reads the JSON "error" field to detect stub verdicts rather than relying on exit code
-python "${CLAUDE_PLUGIN_ROOT}/scripts/anvil-review.py" --provider gemini --task-id "$TASK_ID" --diff-file /tmp/anvil-diff-"$TASK_ID".patch || true
-python "${CLAUDE_PLUGIN_ROOT}/scripts/anvil-review.py" --provider ollama --task-id "$TASK_ID" --diff-file /tmp/anvil-diff-"$TASK_ID".patch || true
-python "${CLAUDE_PLUGIN_ROOT}/scripts/anvil-review.py" --provider openai --task-id "$TASK_ID" --diff-file /tmp/anvil-diff-"$TASK_ID".patch || true
+python "${CLAUDE_PLUGIN_ROOT}/scripts/anvil-review.py" --provider gemini --task-id "$TASK_ID" --diff-file "$ANVIL_TMPDIR/anvil-diff-$TASK_ID.patch" || true
+python "${CLAUDE_PLUGIN_ROOT}/scripts/anvil-review.py" --provider ollama --task-id "$TASK_ID" --diff-file "$ANVIL_TMPDIR/anvil-diff-$TASK_ID.patch" || true
+python "${CLAUDE_PLUGIN_ROOT}/scripts/anvil-review.py" --provider openai --task-id "$TASK_ID" --diff-file "$ANVIL_TMPDIR/anvil-diff-$TASK_ID.patch" || true
 ```
 
 After each reviewer finishes, read its JSON verdict and INSERT into the ledger:
 
 ```bash
-VERDICT_FILE=/tmp/anvil-review-gemini-"$TASK_ID".json
-VERDICT=$(python -c "import json,sys; d=json.load(open('$VERDICT_FILE')); print(d['verdict'])")
+VERDICT_FILE="$ANVIL_TMPDIR/anvil-review-gemini-$TASK_ID.json"
+VERDICT=$(python -c "import json,sys; d=json.load(open(sys.argv[1])); print(d['verdict'])" "$VERDICT_FILE")
 PASSED=$([ "$VERDICT" = "pass" ] && echo 1 || echo 0)
 python "${CLAUDE_PLUGIN_ROOT}/scripts/anvil-ledger.py" insert-check \
   --task-id "$TASK_ID" --phase review \
@@ -304,7 +307,7 @@ python "${CLAUDE_PLUGIN_ROOT}/scripts/anvil-ledger.py" insert-check \
   --output-file "$VERDICT_FILE"
 ```
 
-Use `check_name = review-<provider>` (e.g., `review-gemini`, `review-claude`) consistently.
+Use `check_name = review-<provider>` (e.g., `review-gemini`, `review-claude`) consistently. Reuse `$ANVIL_TMPDIR` for each provider without recomputing it.
 
 If real issues were found, fix them, then re-run 5b AND 5c. **Max 2 adversarial rounds.** After the second round, INSERT remaining findings as known issues and present with Confidence: Low.
 

@@ -19,7 +19,7 @@ Usage:
     anvil-review.py --provider openai|gemini|ollama
                     --task-id TASK_ID
                     --diff-file PATH
-                    [--out PATH]        # default /tmp/anvil-review-{provider}-{task_id}.json
+                    [--out PATH]        # default <tmpdir>/anvil-review-{provider}-{task_id}.json (tmpdir via tempfile.gettempdir())
 
 Output:
     - Stdout: one line, e.g. "reviewer=openai verdict=pass findings=0 model=gpt-4o"

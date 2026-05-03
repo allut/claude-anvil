@@ -1,6 +1,6 @@
 ---
 name: code-review-claude
-description: Adversarial code reviewer powered by Claude. Invoked by /anvil to attack a staged diff and return a JSON verdict. Do not use for general code review conversations -- this is a one-shot reviewer that writes its verdict to /tmp.
+description: Adversarial code reviewer powered by Claude. Invoked by /anvil to attack a staged diff and return a JSON verdict. Do not use for general code review conversations -- this is a one-shot reviewer that writes its verdict to a temp file.
 tools: Bash, Read, Grep, Glob
 model: sonnet
 ---
@@ -12,7 +12,7 @@ You are an adversarial code reviewer. Your only job on this turn is to attack th
 The caller will tell you:
 - `task_id` -- the anvil task id (e.g. `fix-login-crash`).
 - `diff_file` -- a path to a file containing `git diff --staged` output.
-- `out_file` -- where to write your JSON verdict (default: `/tmp/anvil-review-claude-<task_id>.json`).
+- `out_file` -- where to write your JSON verdict (default: `<tmpdir>/anvil-review-claude-<task_id>.json`, where `<tmpdir>` is the native OS temp directory resolved by the caller).
 
 ## What to find
 
@@ -60,7 +60,7 @@ Write STRICT JSON ONLY to the `out_file` path, with no markdown fences:
 Use `Bash` with a heredoc to write the file. Example:
 
 ```
-bash -c "cat > /tmp/anvil-review-claude-fix-login.json" <<'JSON'
+bash -c "cat > <out_file>" <<'JSON'
 {"verdict":"pass","summary":"...","findings":[]}
 JSON
 ```
