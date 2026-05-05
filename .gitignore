@@ -15,6 +15,7 @@
 .ref-*.md
 .scratch/
 tmp/
+report.md
 
 # Claude Code per-user settings (not part of the plugin distribution)
 .claude/settings.local.json
