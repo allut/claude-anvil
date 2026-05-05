@@ -259,8 +259,10 @@ Before launching reviewers, stage your changes and snapshot the diff (reviewers 
 
 ```bash
 ANVIL_TMPDIR=$(python -c "import tempfile; print(tempfile.gettempdir())") # native Windows path; avoids MSYS2 /tmp translation gap
+DIFF_FILE="$ANVIL_TMPDIR/anvil-diff-$TASK_ID.patch"
+CLAUDE_OUT="$ANVIL_TMPDIR/anvil-review-claude-$TASK_ID.json"
 git add -A
-git --no-pager diff --staged > "$ANVIL_TMPDIR/anvil-diff-$TASK_ID.patch"
+git --no-pager diff --staged > "$DIFF_FILE"
 ```
 
 **Claude (Task subagent) is the ONLY reviewer you can spawn with a Claude model.** GPT / Gemini / Ollama are each invoked via a Bash call to `anvil-review.py`. Issue `Task` and `Bash` calls in the **same assistant turn** so they run in parallel.
@@ -277,20 +279,45 @@ ANVIL_LARGE=$(python "${CLAUDE_PLUGIN_ROOT}/scripts/anvil-config.py" roster larg
 
 **Claude reviewer call (Task tool):**
 
-Spawn the `code-review-claude` subagent with this prompt:
+Spawn the `code-review-claude` subagent with this prompt (substitute `<TASK_ID>`, `<DIFF_FILE>`, and `<CLAUDE_OUT>` with the literal resolved values of those shell variables — not shell variable syntax — since the Task tool receives a plain string, not a bash script):
 
-> task_id=`<TASK_ID>` diff_file=`<ANVIL_TMPDIR>/anvil-diff-<TASK_ID>.patch` out_file=`<ANVIL_TMPDIR>/anvil-review-claude-<TASK_ID>.json`. Attack the diff. Find bugs, security issues, logic errors, race conditions, edge cases, missing error handling, and architectural violations. Ignore style. Write strict JSON to out_file per your system prompt, then print one `reviewer=claude ...` summary line.
+> task_id=`<TASK_ID>` diff_file=`<value of $DIFF_FILE>` out_file=`<value of $CLAUDE_OUT>`. Attack the diff. Find bugs, security issues, logic errors, race conditions, edge cases, missing error handling, and architectural violations. Ignore style. Write strict JSON to out_file per your system prompt, then print one `reviewer=claude ...` summary line.
 
-Substitute `<ANVIL_TMPDIR>` with the actual value of `$ANVIL_TMPDIR` resolved above when constructing this prompt.
+After the Task tool returns, read the verdict and INSERT into the ledger:
+
+```bash
+VERDICT=$(python -c "import json,sys; d=json.load(open(sys.argv[1])); print(d['verdict'])" "$CLAUDE_OUT")
+PASSED=$([ "$VERDICT" = "pass" ] && echo 1 || echo 0)
+python "${CLAUDE_PLUGIN_ROOT}/scripts/anvil-ledger.py" insert-check \
+  --task-id "$TASK_ID" --phase review \
+  --check "review-claude" --tool "code-review-claude" \
+  --command "Task(subagent_type=code-review-claude)" \
+  --exit-code 0 --passed "$PASSED" \
+  --output-file "$CLAUDE_OUT"
+```
+
+The reviewer JSON schema (both Claude and external providers use the same schema):
+
+| Field | Type | Notes |
+|-------|------|-------|
+| `verdict` | `"pass"` \| `"concern"` \| `"fail"` | Top-level result |
+| `summary` | string | One-sentence overall take |
+| `findings[].severity` | `"high"` \| `"medium"` \| `"low"` | Finding severity |
+| `findings[].file` | string | `path/to/file.py:line` or `path/to/file.py` |
+| `findings[].what` | string | What the problem is |
+| `findings[].why` | string | Why it matters |
+| `findings[].fix` | string | Concrete fix |
+
+There is no `description` or `location` field. Use `what` and `file` for findings text and location.
 
 **External reviewer calls (Bash, run in parallel with the Task call):**
 
 ```bash
 # anvil-review.py exits 0 on all provider errors (stub verdict written); || true suppresses all non-zero exits including
 # exit 2 (diff file missing) — the /anvil loop reads the JSON "error" field to detect stub verdicts rather than relying on exit code
-python "${CLAUDE_PLUGIN_ROOT}/scripts/anvil-review.py" --provider gemini --task-id "$TASK_ID" --diff-file "$ANVIL_TMPDIR/anvil-diff-$TASK_ID.patch" || true
-python "${CLAUDE_PLUGIN_ROOT}/scripts/anvil-review.py" --provider ollama --task-id "$TASK_ID" --diff-file "$ANVIL_TMPDIR/anvil-diff-$TASK_ID.patch" || true
-python "${CLAUDE_PLUGIN_ROOT}/scripts/anvil-review.py" --provider openai --task-id "$TASK_ID" --diff-file "$ANVIL_TMPDIR/anvil-diff-$TASK_ID.patch" || true
+python "${CLAUDE_PLUGIN_ROOT}/scripts/anvil-review.py" --provider gemini --task-id "$TASK_ID" --diff-file "$DIFF_FILE" || true
+python "${CLAUDE_PLUGIN_ROOT}/scripts/anvil-review.py" --provider ollama --task-id "$TASK_ID" --diff-file "$DIFF_FILE" || true
+python "${CLAUDE_PLUGIN_ROOT}/scripts/anvil-review.py" --provider openai --task-id "$TASK_ID" --diff-file "$DIFF_FILE" || true
 ```
 
 After each reviewer finishes, read its JSON verdict and INSERT into the ledger:
