@@ -286,8 +286,8 @@ Spawn the `code-review-claude` subagent with this prompt (substitute `<TASK_ID>`
 After the Task tool returns, read the verdict and INSERT into the ledger:
 
 ```bash
-VERDICT=$(python -c "import json,sys; d=json.load(open(sys.argv[1])); print(d['verdict'])" "$CLAUDE_OUT")
-PASSED=$([ "$VERDICT" = "pass" ] && echo 1 || echo 0)
+VERDICT=$(python -c "import json,sys; d=json.load(open(sys.argv[1])); print(d.get('verdict','fail'))" "$CLAUDE_OUT" 2>/dev/null || echo fail)
+PASSED=$([ "$VERDICT" = "fail" ] && echo 0 || echo 1)
 python "${CLAUDE_PLUGIN_ROOT}/scripts/anvil-ledger.py" insert-check \
   --task-id "$TASK_ID" --phase review \
   --check "review-claude" --tool "code-review-claude" \
@@ -324,8 +324,8 @@ After each reviewer finishes, read its JSON verdict and INSERT into the ledger:
 
 ```bash
 VERDICT_FILE="$ANVIL_TMPDIR/anvil-review-gemini-$TASK_ID.json"
-VERDICT=$(python -c "import json,sys; d=json.load(open(sys.argv[1])); print(d['verdict'])" "$VERDICT_FILE")
-PASSED=$([ "$VERDICT" = "pass" ] && echo 1 || echo 0)
+VERDICT=$(python -c "import json,sys; d=json.load(open(sys.argv[1])); print(d.get('verdict','fail'))" "$VERDICT_FILE" 2>/dev/null || echo fail)
+PASSED=$([ "$VERDICT" = "fail" ] && echo 0 || echo 1)
 python "${CLAUDE_PLUGIN_ROOT}/scripts/anvil-ledger.py" insert-check \
   --task-id "$TASK_ID" --phase review \
   --check "review-gemini" --tool "anvil-review" \
