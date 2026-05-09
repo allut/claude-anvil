@@ -381,7 +381,16 @@ def _http_get_json(url: str, headers: dict[str, str] | None = None,
     req = urllib.request.Request(url, method="GET")
     for k, v in (headers or {}).items():
         req.add_header(k, v)
-    with urllib.request.urlopen(req, timeout=timeout) as resp:
+    try:
+        import certifi
+        _ctx: ssl.SSLContext | None = ssl.create_default_context(cafile=certifi.where())
+    except ImportError:
+        print("anvil-config: certifi not found — using system CA store (may fail on macOS python.org Python); "
+              "run: pip3 install certifi", file=sys.stderr)
+        _ctx = None
+    except Exception:
+        _ctx = None
+    with urllib.request.urlopen(req, timeout=timeout, context=_ctx) as resp:
         body = resp.read().decode("utf-8", errors="replace")
         try:
             return resp.status, json.loads(body), body
@@ -730,10 +739,45 @@ def _gui_key_dialog(provider: str) -> str:
     sw, sh = dlg.winfo_screenwidth(), dlg.winfo_screenheight()
     dlg.geometry(f"+{(sw - w) // 2}+{(sh - h) // 2}")
 
+    dlg.lift()
+    dlg.focus_force()
     dlg.grab_set()
     root.wait_window(dlg)
     root.destroy()
     return result[0]
+
+
+_OSASCRIPT_CANCELLED = object()  # sentinel: user explicitly cancelled the dialog
+
+
+def _osascript_key_dialog(provider: str) -> "str | object":
+    """Use osascript on macOS to show a native password dialog.
+
+    Returns:
+        - The entered key string on OK (may be empty string if field was cleared).
+        - _OSASCRIPT_CANCELLED sentinel if the user clicked Cancel.
+        - "" (empty string) on any system/launch error (fall through to next method).
+    """
+    script = (
+        f'set x to text returned of (display dialog "Enter {provider.capitalize()} API key:" '
+        f'default answer "" with hidden answer buttons {{"Cancel", "OK"}} default button "OK")\n'
+        f'return x'
+    )
+    try:
+        r = subprocess.run(
+            ["osascript", "-e", script],
+            capture_output=True, text=True, timeout=120,
+        )
+        if r.returncode == 0:
+            return r.stdout.strip()
+        # AppleScript exits non-zero when the user clicks Cancel; stderr contains
+        # "User canceled" (or the locale equivalent). Treat any cancellation as
+        # an intentional abort — do NOT fall through to Tkinter/getpass.
+        if r.returncode != 0:
+            return _OSASCRIPT_CANCELLED
+    except (FileNotFoundError, subprocess.TimeoutExpired, OSError):
+        pass
+    return ""
 
 
 def cmd_gui_key(args: argparse.Namespace) -> int:
@@ -741,11 +785,28 @@ def cmd_gui_key(args: argparse.Namespace) -> int:
     provider = args.provider
     key = ""
 
-    # Try custom Tkinter dialog first — works on Windows/macOS/Linux with a display.
-    try:
-        key = _gui_key_dialog(provider)
-    except Exception:
-        # Fall back to getpass (needs a real TTY)
+    # On macOS, try osascript first — it opens a native system dialog independent of the
+    # Python display context and works in Claude Code's Bash runner and the ! prefix.
+    if sys.platform == "darwin":
+        try:
+            result = _osascript_key_dialog(provider)
+            if result is _OSASCRIPT_CANCELLED:
+                print(f"anvil-config: key dialog cancelled, {provider} key unchanged",
+                      file=sys.stderr)
+                return 1
+            key = result  # may be "" (launch failed) — fall through to Tkinter
+        except Exception:
+            pass
+
+    # Try custom Tkinter dialog if osascript didn't produce a key.
+    if not key:
+        try:
+            key = _gui_key_dialog(provider)
+        except Exception:
+            pass
+
+    # Last resort: getpass (needs a real TTY) then raw stdin.
+    if not key:
         try:
             import getpass
             key = getpass.getpass(f"Enter {provider} API key (input hidden): ")

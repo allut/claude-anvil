@@ -182,12 +182,22 @@ def normalize_verdict(raw: dict | None, fallback_summary: str) -> dict:
 
 
 def http_post_json(url: str, payload: dict, headers: dict, timeout: float = 180.0) -> dict:
+    import ssl
     body = json.dumps(payload).encode("utf-8")
     req = urllib.request.Request(url, data=body, method="POST")
     req.add_header("Content-Type", "application/json")
     for k, v in headers.items():
         req.add_header(k, v)
-    with urllib.request.urlopen(req, timeout=timeout) as resp:
+    try:
+        import certifi
+        _ctx: ssl.SSLContext | None = ssl.create_default_context(cafile=certifi.where())
+    except ImportError:
+        print("anvil-review: certifi not found — using system CA store (may fail on macOS python.org Python); "
+              "run: pip3 install certifi", file=sys.stderr)
+        _ctx = None
+    except Exception:
+        _ctx = None
+    with urllib.request.urlopen(req, timeout=timeout, context=_ctx) as resp:
         return json.loads(resp.read().decode("utf-8", errors="replace"))
 
 

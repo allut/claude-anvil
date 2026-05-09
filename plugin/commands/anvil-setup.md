@@ -15,7 +15,7 @@ The user's argument is:
 ## Rules of engagement
 
 1. **Use `AskUserQuestion` for every choice** — never improvise free-text prompts. Multi-choice only.
-2. **Collect API keys via `gui-key`** — run `python "${CLAUDE_PLUGIN_ROOT}/scripts/anvil-config.py" gui-key <provider>` to open a password-masked GUI dialog. The key never appears in the conversation, shell arguments, or tool results. Do not use `AskUserQuestion` to collect keys and do not use `prompt-key`.
+2. **Collect API keys via `gui-key`** — run `python3 "${CLAUDE_PLUGIN_ROOT}/scripts/anvil-config.py" gui-key <provider>` to open a password-masked GUI dialog. The key never appears in the conversation, shell arguments, or tool results. Do not use `AskUserQuestion` to collect keys and do not use `prompt-key`.
 3. **Never block the user with task work mid-wizard.** This is config only. No `git`, no edits to source code other than `agents/code-review-claude.md:5` (the `model:` line) when the user picks a Claude model.
 4. **All file I/O goes through `${CLAUDE_PLUGIN_ROOT}/scripts/anvil-config.py`.** Don't write `config.json` directly.
 5. **Idempotent.** Re-running this wizard MUST be safe. If the user cancels at any step, leave existing config untouched.
@@ -25,7 +25,7 @@ The user's argument is:
 ### 1. Snapshot current state
 
 ```bash
-python "${CLAUDE_PLUGIN_ROOT}/scripts/anvil-config.py" status
+python3 "${CLAUDE_PLUGIN_ROOT}/scripts/anvil-config.py" status
 ```
 
 Three possible outputs: `configured`, `partial`, `needs-setup`.
@@ -35,14 +35,14 @@ Three possible outputs: `configured`, `partial`, `needs-setup`.
   - "Show current config"
   - "Cancel"
 
-  On "Show current config": run `python "${CLAUDE_PLUGIN_ROOT}/scripts/anvil-config.py" summary` and stop.
+  On "Show current config": run `python3 "${CLAUDE_PLUGIN_ROOT}/scripts/anvil-config.py" summary` and stop.
   On "Cancel": stop.
   On "Reconfigure from scratch": continue to Step 2.
 
 - If `$ARGUMENTS` is `reset`: clear existing keychain entries before continuing to Step 2:
   ```bash
-  python "${CLAUDE_PLUGIN_ROOT}/scripts/anvil-config.py" keychain-delete openai
-  python "${CLAUDE_PLUGIN_ROOT}/scripts/anvil-config.py" keychain-delete gemini
+  python3 "${CLAUDE_PLUGIN_ROOT}/scripts/anvil-config.py" keychain-delete openai
+  python3 "${CLAUDE_PLUGIN_ROOT}/scripts/anvil-config.py" keychain-delete gemini
   ```
 - If output is `partial` or `needs-setup`: continue to Step 2.
 
@@ -65,7 +65,7 @@ If the user selects nothing, push back: "At least one reviewer must be enabled, 
 
 Build the config JSON as you go. Start from defaults via:
 ```bash
-python "${CLAUDE_PLUGIN_ROOT}/scripts/anvil-config.py" read 2>/dev/null
+python3 "${CLAUDE_PLUGIN_ROOT}/scripts/anvil-config.py" read 2>/dev/null
 ```
 If `read` exits non-zero (no existing config), use this default skeleton:
 ```json
@@ -102,15 +102,22 @@ If the user picks "Skip this reviewer", set `reviewers.openai.enabled = false` a
 If "Yes": tell the user "A dialog box will appear — enter your key there. It won't appear in this conversation.", then run:
 
 ```bash
-python "${CLAUDE_PLUGIN_ROOT}/scripts/anvil-config.py" set openai \
+python3 "${CLAUDE_PLUGIN_ROOT}/scripts/anvil-config.py" set openai \
     enabled=true \
     endpoint="<chosen endpoint>" \
     model="<chosen model>" \
     json_mode="on"
-python "${CLAUDE_PLUGIN_ROOT}/scripts/anvil-config.py" gui-key openai
+python3 "${CLAUDE_PLUGIN_ROOT}/scripts/anvil-config.py" gui-key openai
 ```
 
 The `gui-key` command prints `ok (api_key stored in <location>)` — relay this to the user so they know where the key was saved (macOS Keychain, DPAPI-encrypted, or plaintext).
+
+If `gui-key` exits non-zero (no key entered), tell the user:
+> ⚠️ The key dialog could not open in Claude Code's terminal. Open a real terminal (Terminal.app / iTerm2 on macOS; cmd / PowerShell on Windows) and run:
+> - **macOS / Linux**: `python3 "${CLAUDE_PLUGIN_ROOT}/scripts/anvil-config.py" gui-key openai`
+> - **Windows**: `python "${CLAUDE_PLUGIN_ROOT}/scripts/anvil-config.py" gui-key openai`
+>
+> Then return here and re-run `/anvil-setup` to validate.
 
 `AskUserQuestion` "Enable strict JSON mode? (Set to off only if your model rejects `response_format: json_object` — usually free-tier OpenRouter/Groq.)":
 - `on (default, recommended)`
@@ -133,13 +140,20 @@ If the user picks "Skip this reviewer", set `reviewers.gemini.enabled = false` a
 If "Yes": tell the user "A dialog box will appear — enter your key there. It won't appear in this conversation.", then run:
 
 ```bash
-python "${CLAUDE_PLUGIN_ROOT}/scripts/anvil-config.py" set gemini \
+python3 "${CLAUDE_PLUGIN_ROOT}/scripts/anvil-config.py" set gemini \
     enabled=true \
     model="<choice>"
-python "${CLAUDE_PLUGIN_ROOT}/scripts/anvil-config.py" gui-key gemini
+python3 "${CLAUDE_PLUGIN_ROOT}/scripts/anvil-config.py" gui-key gemini
 ```
 
 The `gui-key` command prints `ok (api_key stored in <location>)` — relay this to the user so they know where the key was saved.
+
+If `gui-key` exits non-zero (no key entered), tell the user:
+> ⚠️ The key dialog could not open in Claude Code's terminal. Open a real terminal (Terminal.app / iTerm2 on macOS; cmd / PowerShell on Windows) and run:
+> - **macOS / Linux**: `python3 "${CLAUDE_PLUGIN_ROOT}/scripts/anvil-config.py" gui-key gemini`
+> - **Windows**: `python "${CLAUDE_PLUGIN_ROOT}/scripts/anvil-config.py" gui-key gemini`
+>
+> Then return here and re-run `/anvil-setup` to validate.
 
 #### 3d. Ollama
 
@@ -154,18 +168,34 @@ The `gui-key` command prints `ok (api_key stored in <location>)` — relay this 
 - `Custom` (ask for the tag)
 
 ```bash
-python "${CLAUDE_PLUGIN_ROOT}/scripts/anvil-config.py" set ollama \
+python3 "${CLAUDE_PLUGIN_ROOT}/scripts/anvil-config.py" set ollama \
     enabled=true \
     host="<host>" \
     model="<choice>"
 ```
 
-### 4. Validate each enabled reviewer
+### 4. Preflight: SSL certificate check
+
+Before validating any reviewer, check that Python can make TLS connections:
+
+```bash
+python3 -c "import certifi; print('certifi ok:', certifi.where())" 2>&1
+```
+
+- If this prints `certifi ok: ...` → proceed to validation.
+- If it prints an ImportError → warn the user and offer to install certifi:
+  ```bash
+  pip3 install certifi
+  ```
+  After installing, re-run the check. If certifi still can't be imported, tell the user to run `open /Applications/Python\ 3.x/Install\ Certificates.command` (where `3.x` matches their Python version) and retry validation manually.
+- On macOS with the python.org Python 3.12+ installer, `certifi` is the reliable fix for `CERTIFICATE_VERIFY_FAILED` errors on OpenRouter and Gemini.
+
+### 5. Validate each enabled reviewer
 
 For each enabled reviewer, run:
 
 ```bash
-python "${CLAUDE_PLUGIN_ROOT}/scripts/anvil-config.py" validate <provider>
+python3 "${CLAUDE_PLUGIN_ROOT}/scripts/anvil-config.py" validate <provider>
 ```
 
 The helper prints JSON: `{"status": "ok"|"unauthorized"|"unreachable"|"model-missing", "detail": "..."}`.
@@ -173,16 +203,16 @@ The helper prints JSON: `{"status": "ok"|"unauthorized"|"unreachable"|"model-mis
 - `ok` → continue.
 - `unauthorized` → tell the user their key was rejected; loop back to that reviewer's step. Max 2 retries; on the third failure ask `AskUserQuestion`: "Skip this reviewer / Try again / Cancel wizard".
 - `unreachable` → for Ollama, check `ollama serve` is running and re-prompt; for the cloud providers it's usually a network error — retry once, then offer to skip.
-- `model-missing` → see Step 5 (Ollama) or re-prompt for a different model.
+- `model-missing` → see Step 6 (Ollama) or re-prompt for a different model.
 
-### 5. Ollama model pull (only if Ollama is enabled and validate returned `model-missing`)
+### 6. Ollama model pull (only if Ollama is enabled and validate returned `model-missing`)
 
 ```bash
 ollama pull <chosen-model>
 ```
 Stream output to the user so they see progress. After the pull, re-run `validate ollama`. If it still reports `model-missing`, surface the failure and let the user pick a different model.
 
-### 6. Derive rosters
+### 7. Derive rosters
 
 Compute roster fields based on what was enabled. Priority order: `claude > gemini > openai > ollama`.
 
@@ -194,40 +224,40 @@ large  = up to 3 enabled reviewers in priority order
 Build the final config JSON (read current with `anvil-config.py read`, replace `roster.medium` and `roster.large`, set `setup_completed` to a UTC ISO timestamp), then save:
 
 ```bash
-python -c "
+python3 -c "
 import json, datetime, sys, subprocess
-cfg = json.loads(subprocess.check_output(['python', '${CLAUDE_PLUGIN_ROOT}/scripts/anvil-config.py', 'read']))
+cfg = json.loads(subprocess.check_output(['python3', '${CLAUDE_PLUGIN_ROOT}/scripts/anvil-config.py', 'read']))
 priority = ['claude', 'gemini', 'openai', 'ollama']
 enabled = [p for p in priority if cfg['reviewers'].get(p, {}).get('enabled')]
 cfg['roster']['medium'] = enabled[:1]
 cfg['roster']['large']  = enabled[:3]
 cfg['setup_completed']  = datetime.datetime.now(datetime.timezone.utc).strftime('%Y-%m-%dT%H:%M:%SZ')
 print(json.dumps(cfg))
-" | python "${CLAUDE_PLUGIN_ROOT}/scripts/anvil-config.py" save
+" | python3 "${CLAUDE_PLUGIN_ROOT}/scripts/anvil-config.py" save
 ```
 
-### 7. Initialize the ledger and record completion
+### 8. Initialize the ledger and record completion
 
 ```bash
-python "${CLAUDE_PLUGIN_ROOT}/scripts/anvil-ledger.py" init
-python "${CLAUDE_PLUGIN_ROOT}/scripts/anvil-ledger.py" memory-set anvil-setup-completed "$(python -c "import datetime;print(datetime.datetime.now(datetime.timezone.utc).strftime('%Y-%m-%dT%H:%M:%SZ'))")"
+python3 "${CLAUDE_PLUGIN_ROOT}/scripts/anvil-ledger.py" init
+python3 "${CLAUDE_PLUGIN_ROOT}/scripts/anvil-ledger.py" memory-set anvil-setup-completed "$(python3 -c "import datetime;print(datetime.datetime.now(datetime.timezone.utc).strftime('%Y-%m-%dT%H:%M:%SZ'))")"
 ```
 
-### 8. Summary
+### 9. Summary
 
-Run `python "${CLAUDE_PLUGIN_ROOT}/scripts/anvil-config.py" summary` and present the masked summary to the user, plus:
+Run `python3 "${CLAUDE_PLUGIN_ROOT}/scripts/anvil-config.py" summary` and present the masked summary to the user, plus:
 
 - Which reviewers passed validation (`ok`/`skipped`/`unauthorized`/etc.)
 - The chosen Claude model (file `agents/code-review-claude.md` was rewritten on disk).
 - Roster: medium / large.
 - Rollback hint:
   > To redo setup later, run `/anvil-setup reset` or `rm ~/.claude-anvil/config.json`.
-  > Note: `/anvil-setup reset` also removes any keychain entries. If you delete config.json manually, run `python scripts/anvil-config.py keychain-delete openai` and `keychain-delete gemini` to remove keychain entries too.
-- Key storage hint (show output of `python "${CLAUDE_PLUGIN_ROOT}/scripts/anvil-config.py" keychain-status`).
-- Next-step hint (shown after Step 9):
+  > Note: `/anvil-setup reset` also removes any keychain entries. If you delete config.json manually, run `python3 scripts/anvil-config.py keychain-delete openai` and `keychain-delete gemini` to remove keychain entries too.
+- Key storage hint (show output of `python3 "${CLAUDE_PLUGIN_ROOT}/scripts/anvil-config.py" keychain-status`).
+- Next-step hint (shown after Step 10):
   > Try `/anvil <task>` now.
 
-### 9. Create bare command shortcuts (optional)
+### 10. Create bare command shortcuts (optional)
 
 Ask the user via `AskUserQuestion`:
 
@@ -240,7 +270,7 @@ Choices:
 If yes, run:
 
 ```bash
-python "${CLAUDE_PLUGIN_ROOT}/scripts/anvil-config.py" create-shortcuts "${CLAUDE_PLUGIN_ROOT}"
+python3 "${CLAUDE_PLUGIN_ROOT}/scripts/anvil-config.py" create-shortcuts "${CLAUDE_PLUGIN_ROOT}"
 ```
 
 Report the full output (which files were created and where the plugin-root link points). Inform the user the bare commands are ready to use immediately in any new conversation.

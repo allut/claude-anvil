@@ -18,8 +18,8 @@ The user's request is:
 
 This plugin ships a SQLite verification ledger and a few helper scripts. You interact with them through Bash:
 
-- **Ledger + session memory + learnable facts**: `python "${CLAUDE_PLUGIN_ROOT}/scripts/anvil-ledger.py" <subcommand>` (subcommands: `init`, `insert-check`, `select-bundle`, `count-phase`, `start-session`, `end-session`, `track-edit`, `recall`, `recall-issues`, `memory-set`, `memory-get`, `memory-list`).
-- **External adversarial reviewers** (GPT, Gemini, Ollama): `python "${CLAUDE_PLUGIN_ROOT}/scripts/anvil-review.py" --provider openai|gemini|ollama --task-id TASK_ID --diff-file "$ANVIL_TMPDIR/anvil-diff-TASK_ID.patch"`. Writes a JSON verdict you then read and INSERT into the ledger.
+- **Ledger + session memory + learnable facts**: `python3 "${CLAUDE_PLUGIN_ROOT}/scripts/anvil-ledger.py" <subcommand>` (subcommands: `init`, `insert-check`, `select-bundle`, `count-phase`, `start-session`, `end-session`, `track-edit`, `recall`, `recall-issues`, `memory-set`, `memory-get`, `memory-list`).
+- **External adversarial reviewers** (GPT, Gemini, Ollama): `python3 "${CLAUDE_PLUGIN_ROOT}/scripts/anvil-review.py" --provider openai|gemini|ollama --task-id TASK_ID --diff-file "$ANVIL_TMPDIR/anvil-diff-TASK_ID.patch"`. Writes a JSON verdict you then read and INSERT into the ledger.
 - **Claude adversarial reviewer**: invoke `Task(subagent_type="code-review-claude", ...)` (see 5c below).
 - **IDE diagnostics**: call `mcp__ide__getDiagnostics` directly.
 - **Library docs**: `mcp__plugin_claude-anvil_context7__resolve-library-id` then `mcp__plugin_claude-anvil_context7__query-docs`.
@@ -90,7 +90,7 @@ CREATE TABLE anvil_checks (
 Every check is an INSERT via:
 
 ```bash
-python "${CLAUDE_PLUGIN_ROOT}/scripts/anvil-ledger.py" insert-check \
+python3 "${CLAUDE_PLUGIN_ROOT}/scripts/anvil-ledger.py" insert-check \
   --task-id "$TASK_ID" --phase baseline|after|review \
   --check "<name>" --tool "<tool>" --command "<command>" \
   --exit-code <n> --passed 0|1 --output-file "$ANVIL_TMPDIR/<output>"
@@ -107,7 +107,7 @@ Steps 0–3b produce **minimal output** — give a one-sentence status text when
 Before Boost, run:
 
 ```bash
-python "${CLAUDE_PLUGIN_ROOT}/scripts/anvil-config.py" status
+python3 "${CLAUDE_PLUGIN_ROOT}/scripts/anvil-config.py" status
 ```
 
 If it prints `needs-setup`, stop the loop and tell the user:
@@ -130,7 +130,7 @@ Only show the boosted prompt if it materially changed the intent:
 Then, for Medium and Large tasks, open a session row so the PostToolUse hook can track your edits:
 
 ```bash
-ANVIL_SESSION_ID=$(python "${CLAUDE_PLUGIN_ROOT}/scripts/anvil-ledger.py" start-session "$TASK_ID" "$(pwd)" "$(git rev-parse --abbrev-ref HEAD 2>/dev/null || echo unknown)")
+ANVIL_SESSION_ID=$(python3 "${CLAUDE_PLUGIN_ROOT}/scripts/anvil-ledger.py" start-session "$TASK_ID" "$(pwd)" "$(git rev-parse --abbrev-ref HEAD 2>/dev/null || echo unknown)")
 ```
 
 Remember `$ANVIL_SESSION_ID` for Step 8 (end-session).
@@ -161,8 +161,8 @@ Internally parse: goal, acceptance criteria, assumptions, open questions. If the
 Before planning, query session history for relevant context on the files you're about to change:
 
 ```bash
-python "${CLAUDE_PLUGIN_ROOT}/scripts/anvil-ledger.py" recall "<filename>"
-python "${CLAUDE_PLUGIN_ROOT}/scripts/anvil-ledger.py" recall-issues "<filename>"
+python3 "${CLAUDE_PLUGIN_ROOT}/scripts/anvil-ledger.py" recall "<filename>"
+python3 "${CLAUDE_PLUGIN_ROOT}/scripts/anvil-ledger.py" recall-issues "<filename>"
 ```
 
 **What to do with recall output:**
@@ -238,7 +238,7 @@ Pattern for each check (redirect both stdout and stderr to a file so the full ou
 ```bash
 npm run build > "$ANVIL_TMPDIR/anvil-build.log" 2>&1
 EXIT=$?
-python "${CLAUDE_PLUGIN_ROOT}/scripts/anvil-ledger.py" insert-check \
+python3 "${CLAUDE_PLUGIN_ROOT}/scripts/anvil-ledger.py" insert-check \
   --task-id "$TASK_ID" --phase after \
   --check build --tool npm --command "npm run build" \
   --exit-code "$EXIT" --passed "$([ $EXIT -eq 0 ] && echo 1 || echo 0)" \
@@ -252,13 +252,13 @@ python "${CLAUDE_PLUGIN_ROOT}/scripts/anvil-ledger.py" insert-check \
 #### 5c. Adversarial Review
 
 **🚫 GATE: Do NOT proceed to 5d until all reviewer verdicts are INSERTed.**
-**Verify:** `python "${CLAUDE_PLUGIN_ROOT}/scripts/anvil-ledger.py" count-phase "$TASK_ID" review`
+**Verify:** `python3 "${CLAUDE_PLUGIN_ROOT}/scripts/anvil-ledger.py" count-phase "$TASK_ID" review`
 **If 0 for Medium or < 3 for Large, go back.**
 
 Before launching reviewers, stage your changes and snapshot the diff (reviewers read from this file):
 
 ```bash
-ANVIL_TMPDIR=$(python -c "import tempfile; print(tempfile.gettempdir())") # native Windows path; avoids MSYS2 /tmp translation gap
+ANVIL_TMPDIR=$(python3 -c "import tempfile; print(tempfile.gettempdir())") # native Windows path; avoids MSYS2 /tmp translation gap
 DIFF_FILE="$ANVIL_TMPDIR/anvil-diff-$TASK_ID.patch"
 CLAUDE_OUT="$ANVIL_TMPDIR/anvil-review-claude-$TASK_ID.json"
 git add -A
@@ -270,8 +270,8 @@ git --no-pager diff --staged > "$DIFF_FILE"
 Roster selection is config-driven (env vars still win when set):
 
 ```bash
-ANVIL_MEDIUM=$(python "${CLAUDE_PLUGIN_ROOT}/scripts/anvil-config.py" roster medium)
-ANVIL_LARGE=$(python "${CLAUDE_PLUGIN_ROOT}/scripts/anvil-config.py" roster large)
+ANVIL_MEDIUM=$(python3 "${CLAUDE_PLUGIN_ROOT}/scripts/anvil-config.py" roster medium)
+ANVIL_LARGE=$(python3 "${CLAUDE_PLUGIN_ROOT}/scripts/anvil-config.py" roster large)
 ```
 
 - **Medium (no 🔴 files)**: pick one reviewer from `$ANVIL_MEDIUM` (default: `claude`). The helper honours `ANVIL_MEDIUM_REVIEWER` if exported, else reads `~/.claude-anvil/config.json`.
@@ -286,9 +286,9 @@ Spawn the `code-review-claude` subagent with this prompt (substitute `<TASK_ID>`
 After the Task tool returns, read the verdict and INSERT into the ledger:
 
 ```bash
-VERDICT=$(python -c "import json,sys; d=json.load(open(sys.argv[1])); print(d.get('verdict','fail'))" "$CLAUDE_OUT" 2>/dev/null || echo fail)
+VERDICT=$(python3 -c "import json,sys; d=json.load(open(sys.argv[1])); print(d.get('verdict','fail'))" "$CLAUDE_OUT" 2>/dev/null || echo fail)
 PASSED=$([ "$VERDICT" = "fail" ] && echo 0 || echo 1)
-python "${CLAUDE_PLUGIN_ROOT}/scripts/anvil-ledger.py" insert-check \
+python3 "${CLAUDE_PLUGIN_ROOT}/scripts/anvil-ledger.py" insert-check \
   --task-id "$TASK_ID" --phase review \
   --check "review-claude" --tool "code-review-claude" \
   --command "Task(subagent_type=code-review-claude)" \
@@ -315,18 +315,18 @@ There is no `description` or `location` field. Use `what` and `file` for finding
 ```bash
 # anvil-review.py exits 0 on all provider errors (stub verdict written); || true suppresses all non-zero exits including
 # exit 2 (diff file missing) — the /anvil loop reads the JSON "error" field to detect stub verdicts rather than relying on exit code
-python "${CLAUDE_PLUGIN_ROOT}/scripts/anvil-review.py" --provider gemini --task-id "$TASK_ID" --diff-file "$DIFF_FILE" || true
-python "${CLAUDE_PLUGIN_ROOT}/scripts/anvil-review.py" --provider ollama --task-id "$TASK_ID" --diff-file "$DIFF_FILE" || true
-python "${CLAUDE_PLUGIN_ROOT}/scripts/anvil-review.py" --provider openai --task-id "$TASK_ID" --diff-file "$DIFF_FILE" || true
+python3 "${CLAUDE_PLUGIN_ROOT}/scripts/anvil-review.py" --provider gemini --task-id "$TASK_ID" --diff-file "$DIFF_FILE" || true
+python3 "${CLAUDE_PLUGIN_ROOT}/scripts/anvil-review.py" --provider ollama --task-id "$TASK_ID" --diff-file "$DIFF_FILE" || true
+python3 "${CLAUDE_PLUGIN_ROOT}/scripts/anvil-review.py" --provider openai --task-id "$TASK_ID" --diff-file "$DIFF_FILE" || true
 ```
 
 After each reviewer finishes, read its JSON verdict and INSERT into the ledger:
 
 ```bash
 VERDICT_FILE="$ANVIL_TMPDIR/anvil-review-gemini-$TASK_ID.json"
-VERDICT=$(python -c "import json,sys; d=json.load(open(sys.argv[1])); print(d.get('verdict','fail'))" "$VERDICT_FILE" 2>/dev/null || echo fail)
+VERDICT=$(python3 -c "import json,sys; d=json.load(open(sys.argv[1])); print(d.get('verdict','fail'))" "$VERDICT_FILE" 2>/dev/null || echo fail)
 PASSED=$([ "$VERDICT" = "fail" ] && echo 0 || echo 1)
-python "${CLAUDE_PLUGIN_ROOT}/scripts/anvil-ledger.py" insert-check \
+python3 "${CLAUDE_PLUGIN_ROOT}/scripts/anvil-ledger.py" insert-check \
   --task-id "$TASK_ID" --phase review \
   --check "review-gemini" --tool "anvil-review" \
   --command "anvil-review.py --provider gemini" \
@@ -354,7 +354,7 @@ INSERT each with `--phase after --check readiness-<type>` (e.g., `readiness-secr
 Generate the bundle from SQL:
 
 ```bash
-python "${CLAUDE_PLUGIN_ROOT}/scripts/anvil-ledger.py" select-bundle "$TASK_ID"
+python3 "${CLAUDE_PLUGIN_ROOT}/scripts/anvil-ledger.py" select-bundle "$TASK_ID"
 ```
 
 Then present to the user:
@@ -402,7 +402,7 @@ Store confirmed facts immediately — don't wait for user acceptance (the sessio
 
 Pattern:
 ```bash
-python "${CLAUDE_PLUGIN_ROOT}/scripts/anvil-ledger.py" memory-set "build-cmd:$(basename $(pwd))" "npm run build -- --strict"
+python3 "${CLAUDE_PLUGIN_ROOT}/scripts/anvil-ledger.py" memory-set "build-cmd:$(basename $(pwd))" "npm run build -- --strict"
 ```
 
 Do NOT store: obvious facts, things already in project instructions, or facts about code you just wrote (it might not get merged).
@@ -431,7 +431,7 @@ After presenting, automatically commit the changes. The user should never have t
 5. Commit: `git commit -m "..."`.
 6. Close the anvil session so the PostToolUse hook stops attaching edits to this task:
    ```bash
-   python "${CLAUDE_PLUGIN_ROOT}/scripts/anvil-ledger.py" end-session "$ANVIL_SESSION_ID" "<one-sentence recap of what changed>"
+   python3 "${CLAUDE_PLUGIN_ROOT}/scripts/anvil-ledger.py" end-session "$ANVIL_SESSION_ID" "<one-sentence recap of what changed>"
    ```
 7. Tell the user:
    ```
