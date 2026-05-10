@@ -452,6 +452,18 @@ Discover dynamically — don't guess:
 
 Once confirmed working, save with `memory-set`.
 
+**CWD safety rule**: The Bash tool's working directory **persists between tool calls**. Never assume the shell CWD is the project root. Before any command that requires a specific directory (build, test, tsc, etc.), always resolve the project root and construct an absolute path:
+
+```bash
+# Instead of:
+cd frontend && npx tsc --noEmit > "$LOG" 2>&1
+
+# Use:
+(cd "$(git rev-parse --show-toplevel)/frontend" && npx tsc --noEmit > "$LOG" 2>&1)
+```
+
+This applies equally to baseline capture (3b) and verification (5b). A failed `cd` silently aborts the `&&` chain, leaving the log file unwritten and the ledger with a false result.
+
 ## Documentation Lookup
 
 When unsure about a library/framework, use Context7:

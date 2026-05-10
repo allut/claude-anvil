@@ -95,10 +95,22 @@ def cmd_insert_check(args: argparse.Namespace) -> None:
         if p.exists():
             output = p.read_text(encoding="utf-8", errors="replace")
         else:
-            print(
-                f"anvil-ledger: warning: --output-file {args.output_file!r} not found; recording empty output",
-                file=sys.stderr,
-            )
+            # Output file missing means the command never wrote output (likely never ran).
+            # Force passed=0 regardless of what the caller reported so a failed `cd` in a
+            # compound `cd X && cmd > $LOG` can't be silently recorded as a pass.
+            if args.passed == 1:
+                args.passed = 0
+                args.exit_code = -1
+                output = "output file missing — command likely did not run"
+                print(
+                    f"anvil-ledger: warning: --output-file {args.output_file!r} not found; forcing passed=0, recording diagnostic message",
+                    file=sys.stderr,
+                )
+            else:
+                print(
+                    f"anvil-ledger: warning: --output-file {args.output_file!r} not found; recording empty output",
+                    file=sys.stderr,
+                )
     elif args.output is not None:
         output = args.output
     output = clip(output)
