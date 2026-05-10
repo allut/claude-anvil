@@ -426,6 +426,98 @@ python3 "${CLAUDE_PLUGIN_ROOT}/scripts/anvil-ledger.py" memory-set "build-cmd:$(
 
 Do NOT store: obvious facts, things already in project instructions, or facts about code you just wrote (it might not get merged).
 
+### 6b. Bug Report Offer (after verification, before presenting)
+
+After completing verification and learning, check whether any bugs were encountered — either in the code being worked on or in Anvil's own execution.
+
+**Two classes of issues to watch for:**
+
+**1. Issues in the user's codebase** — found by reviewers or verification:
+- A reviewer returned one or more findings with `severity: high` or `severity: medium` that could not be fixed before presenting.
+- A verification check failed due to a defect in the changed code, not a pre-existing baseline failure.
+
+**2. Issues in Anvil itself** — infrastructure or tooling failures:
+- A log file was expected but never written (output file missing → ledger recorded empty or false result).
+- A reviewer returned a stub verdict (`"error"` key in JSON, or summary contains "diff file missing" / "could not be performed").
+- A `cd` or path-related command failed with a shell error unrelated to the user's code.
+- The ledger recorded `passed=0` for a check that should have run but didn't (e.g., due to a failed `&&` chain).
+- Any Bash command exited with an unexpected error that was not caused by user-introduced code changes.
+
+**Classify and offer:**
+
+After the loop, reflect on whether any of the above occurred:
+
+1. Classify each issue as: **bug** (reproducible defect), **security** (risk to users), **concern** (non-critical), or **style** (cosmetic). Only bugs and security issues trigger the report offer. **If no issues remain classified as bug or security after this step, skip directly to step 7 — do not prompt the user.**
+
+2. If bugs or security issues were found, use `AskUserQuestion`:
+   > "I found [N] bug(s) during this session — [brief description]. Would you like me to generate a structured bug report?"
+   > Choices: `"Yes, generate bug report"` / `"No, skip"`
+
+3. If the user agrees, generate the report in Markdown using this template:
+
+```markdown
+# Bug Report: {concise title}
+
+**Severity**: High / Medium / Low
+**Session**: {task_id}
+**Phase at time of failure**: {baseline capture / implementation / verification / review}
+**Affected component**: {tool, script, or file where the bug lives}
+
+---
+
+## Summary
+
+{One paragraph: what happened, what was expected, and what actually occurred.}
+
+---
+
+## Reconstructed Timeline / Failure Sequence
+
+| Step | What happened |
+|------|--------------|
+| {step} | {description} |
+
+---
+
+## Root Cause
+
+{Technical explanation of why this happened — the real cause, not just the symptom.}
+
+---
+
+## Impact
+
+{What broke or was wrong as a result. Note any false records in the ledger or incorrect results shown to the user.}
+
+---
+
+## Reproduction Steps
+
+1. {Step 1}
+2. {Step 2}
+3. {Step 3}
+4. Observe {the failure}.
+
+---
+
+## Fix
+
+**Immediate**: {workaround or quick patch}
+
+**Systemic**: {what should change in the instructions or code to prevent recurrence}
+
+---
+
+## Files Involved
+
+- `{path/to/file}` — {role in the bug}
+```
+
+4. After generating the report, tell the user:
+
+   > 📋 **Bug report ready.** To file this issue, visit: https://github.com/allut/claude-anvil/issues
+   > Copy the report above into a new issue. Suggested title: "{concise title}"
+
 ### 7. Present
 
 The user sees at most:
