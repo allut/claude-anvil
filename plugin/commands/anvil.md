@@ -255,7 +255,13 @@ python3 "${CLAUDE_PLUGIN_ROOT}/scripts/anvil-ledger.py" insert-check \
 **Verify:** `python3 "${CLAUDE_PLUGIN_ROOT}/scripts/anvil-ledger.py" count-phase "$TASK_ID" review`
 **If 0 for Medium or < 3 for Large, go back.**
 
-Before launching reviewers, stage your changes and snapshot the diff (reviewers read from this file):
+Before launching reviewers, emit a status line so the user knows review is starting (this prevents a silent multi-minute stall):
+
+```
+Adversarial review in progress.
+```
+
+Then stage your changes and snapshot the diff (reviewers read from this file):
 
 ```bash
 ANVIL_TMPDIR=$(python3 -c "import tempfile; print(tempfile.gettempdir())") # native Windows path; avoids MSYS2 /tmp translation gap
@@ -263,7 +269,14 @@ DIFF_FILE="$ANVIL_TMPDIR/anvil-diff-$TASK_ID.patch"
 CLAUDE_OUT="$ANVIL_TMPDIR/anvil-review-claude-$TASK_ID.json"
 git add -A
 git --no-pager diff --staged > "$DIFF_FILE"
+# Verify the diff file has content — existence alone doesn't mean anything was staged
+[ -s "$DIFF_FILE" ] || { echo "ERROR: diff file is empty — nothing staged"; exit 1; }
+ls -la "$DIFF_FILE"
 ```
+
+**🚫 Do NOT proceed if the content check fails.** An empty diff means nothing was staged; all reviewers would return trivially clean verdicts. The diff file path comes from `$ANVIL_TMPDIR`, which on macOS is `/var/folders/…/T`, not `/tmp/`. Never hardcode `/tmp/` in reviewer prompts.
+
+**All variable assignments (`ANVIL_TMPDIR`, `DIFF_FILE`, `CLAUDE_OUT`) and the external reviewer Bash calls that reference them must be in a single Bash tool invocation.** Each Bash call runs in a fresh shell — variables set in one call are gone in the next. Either batch everything into one call, or re-resolve and echo the paths at the start of each subsequent call before using them.
 
 **Claude (Task subagent) is the ONLY reviewer you can spawn with a Claude model.** GPT / Gemini / Ollama are each invoked via a Bash call to `anvil-review.py`. Issue `Task` and `Bash` calls in the **same assistant turn** so they run in parallel.
 
@@ -279,9 +292,15 @@ ANVIL_LARGE=$(python3 "${CLAUDE_PLUGIN_ROOT}/scripts/anvil-config.py" roster lar
 
 **Claude reviewer call (Task tool):**
 
-Spawn the `code-review-claude` subagent with this prompt (substitute `<TASK_ID>`, `<DIFF_FILE>`, and `<CLAUDE_OUT>` with the literal resolved values of those shell variables — not shell variable syntax — since the Task tool receives a plain string, not a bash script):
+Before spawning the Task, read `$DIFF_FILE` and `$CLAUDE_OUT` from your Bash context and substitute their **literal resolved values** into the prompt string. The Task tool receives a plain string — shell variables are NOT expanded. If `$DIFF_FILE` resolved to `/var/folders/j5/abc123/T/anvil-diff-my-task.patch`, that full path must appear verbatim in the prompt.
 
-> task_id=`<TASK_ID>` diff_file=`<value of $DIFF_FILE>` out_file=`<value of $CLAUDE_OUT>`. Attack the diff. Find bugs, security issues, logic errors, race conditions, edge cases, missing error handling, and architectural violations. Ignore style. Write strict JSON to out_file per your system prompt, then print one `reviewer=claude ...` summary line.
+**❌ Wrong (variable name):** `diff_file=$DIFF_FILE`
+**❌ Wrong (guessed path):** `diff_file=/tmp/anvil-diff-my-task.patch`
+**✅ Correct (resolved value):** `diff_file=/var/folders/j5/abc123/T/anvil-diff-my-task.patch`
+
+Spawn the `code-review-claude` subagent with this prompt (replacing the angle-bracket placeholders with the actual resolved strings from your Bash output):
+
+> task_id=`<TASK_ID>` diff_file=`<resolved value of $DIFF_FILE>` out_file=`<resolved value of $CLAUDE_OUT>`. Attack the diff. Find bugs, security issues, logic errors, race conditions, edge cases, missing error handling, and architectural violations. Ignore style. Write strict JSON to out_file per your system prompt, then print one `reviewer=claude ...` summary line.
 
 After the Task tool returns, read the verdict and INSERT into the ledger:
 
