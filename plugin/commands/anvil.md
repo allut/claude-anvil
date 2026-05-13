@@ -20,7 +20,7 @@ This plugin ships a SQLite verification ledger and a few helper scripts. You int
 
 - **Ledger + session memory + learnable facts**: `python3 "${CLAUDE_PLUGIN_ROOT}/scripts/anvil-ledger.py" <subcommand>` (subcommands: `init`, `insert-check`, `select-bundle`, `count-phase`, `start-session`, `end-session`, `track-edit`, `recall`, `recall-issues`, `memory-set`, `memory-get`, `memory-list`).
 - **External adversarial reviewers** (GPT, Gemini, Ollama): `python3 "${CLAUDE_PLUGIN_ROOT}/scripts/anvil-review.py" --provider openai|gemini|ollama --task-id TASK_ID --diff-file "$ANVIL_TMPDIR/anvil-diff-TASK_ID.patch"`. Writes a JSON verdict you then read and INSERT into the ledger.
-- **Claude adversarial reviewer**: invoke `Task(subagent_type="code-review-claude", ...)` (see 5c below).
+- **Claude adversarial reviewer**: invoke `Task(subagent_type="claude-anvil:code-review-claude", ...)` (see 5c below).
 - **IDE diagnostics**: call `mcp__ide__getDiagnostics` directly.
 - **Library docs**: `mcp__plugin_claude-anvil_context7__resolve-library-id` then `mcp__plugin_claude-anvil_context7__query-docs`.
 - **User questions**: `AskUserQuestion`. Never improvise a text-only question when a decision is required.
@@ -298,7 +298,7 @@ Before spawning the Task, read `$DIFF_FILE` and `$CLAUDE_OUT` from your Bash con
 **❌ Wrong (guessed path):** `diff_file=/tmp/anvil-diff-my-task.patch`
 **✅ Correct (resolved value):** `diff_file=/var/folders/j5/abc123/T/anvil-diff-my-task.patch`
 
-Spawn the `code-review-claude` subagent with this prompt (replacing the angle-bracket placeholders with the actual resolved strings from your Bash output):
+Spawn the `claude-anvil:code-review-claude` subagent with this prompt (replacing the angle-bracket placeholders with the actual resolved strings from your Bash output):
 
 > task_id=`<TASK_ID>` diff_file=`<resolved value of $DIFF_FILE>` out_file=`<resolved value of $CLAUDE_OUT>`. Attack the diff. Find bugs, security issues, logic errors, race conditions, edge cases, missing error handling, and architectural violations. Ignore style. Write strict JSON to out_file per your system prompt, then print one `reviewer=claude ...` summary line.
 
@@ -310,7 +310,7 @@ PASSED=$([ "$VERDICT" = "fail" ] && echo 0 || echo 1)
 python3 "${CLAUDE_PLUGIN_ROOT}/scripts/anvil-ledger.py" insert-check \
   --task-id "$TASK_ID" --phase review \
   --check "review-claude" --tool "code-review-claude" \
-  --command "Task(subagent_type=code-review-claude)" \
+  --command "Task(subagent_type=claude-anvil:code-review-claude)" \
   --exit-code 0 --passed "$PASSED" \
   --output-file "$CLAUDE_OUT"
 ```
@@ -442,6 +442,7 @@ After completing verification and learning, check whether any bugs were encounte
 - A `cd` or path-related command failed with a shell error unrelated to the user's code.
 - The ledger recorded `passed=0` for a check that should have run but didn't (e.g., due to a failed `&&` chain).
 - Any Bash command exited with an unexpected error that was not caused by user-introduced code changes.
+- An `Agent(...)` tool call returned an error (e.g., "Agent type not found", timeout, or any error key in the result) — even if a subsequent retry succeeded. A successful retry does not erase the defect in the instructions that caused the first failure.
 
 **Classify and offer:**
 
