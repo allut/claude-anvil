@@ -298,21 +298,35 @@ Before spawning the Task, read `$DIFF_FILE` and `$CLAUDE_OUT` from your Bash con
 **❌ Wrong (guessed path):** `diff_file=/tmp/anvil-diff-my-task.patch`
 **✅ Correct (resolved value):** `diff_file=/var/folders/j5/abc123/T/anvil-diff-my-task.patch`
 
+**🚫 Do NOT pass `run_in_background=true` to the Claude reviewer Task.** The Task must be synchronous — the loop reads the verdict file immediately after `Task` returns. If the agent runs in background, the output file will not exist when you check for it, and any verdict you insert at that point is fabricated. If the output file is missing after `Task` returns (and no error was thrown), do NOT classify this as `reviewer-unavailable`. Instead: INSERT `--check review-loop-failure --passed 0` with an output explaining the gap, trigger step 6b, and do not commit.
+
 Spawn the `claude-anvil:code-review-claude` subagent with this prompt (replacing the angle-bracket placeholders with the actual resolved strings from your Bash output):
 
 > task_id=`<TASK_ID>` diff_file=`<resolved value of $DIFF_FILE>` out_file=`<resolved value of $CLAUDE_OUT>`. Attack the diff. Find bugs, security issues, logic errors, race conditions, edge cases, missing error handling, and architectural violations. Ignore style. Write strict JSON to out_file per your system prompt, then print one `reviewer=claude ...` summary line.
 
-After the Task tool returns, read the verdict and INSERT into the ledger:
+After the Task tool returns, **first check that the output file exists**. If it does not exist (and no error was thrown by the Task), do NOT run the normal verdict-reading INSERT — that would silently insert a fabricated `passed=0` row. Instead, INSERT a `review-loop-failure` row and trigger step 6b:
 
 ```bash
-VERDICT=$(python3 -c "import json,sys; d=json.load(open(sys.argv[1])); print(d.get('verdict','fail'))" "$CLAUDE_OUT" 2>/dev/null || echo fail)
-PASSED=$([ "$VERDICT" = "fail" ] && echo 0 || echo 1)
-python3 "${CLAUDE_PLUGIN_ROOT}/scripts/anvil-ledger.py" insert-check \
-  --task-id "$TASK_ID" --phase review \
-  --check "review-claude" --tool "code-review-claude" \
-  --command "Task(subagent_type=claude-anvil:code-review-claude)" \
-  --exit-code 0 --passed "$PASSED" \
-  --output-file "$CLAUDE_OUT"
+# Guard: only read the verdict if the file was actually written
+if [ ! -s "$CLAUDE_OUT" ]; then
+  printf '{"verdict":"fail","summary":"review-loop-failure: output file not written after synchronous Task returned","findings":[]}' > "$CLAUDE_OUT"
+  python3 "${CLAUDE_PLUGIN_ROOT}/scripts/anvil-ledger.py" insert-check \
+    --task-id "$TASK_ID" --phase review \
+    --check "review-loop-failure" --tool "code-review-claude" \
+    --command "Task(subagent_type=claude-anvil:code-review-claude)" \
+    --exit-code 1 --passed 0 \
+    --output-file "$CLAUDE_OUT"
+  # Trigger step 6b and do NOT commit — see step 6b for handling
+else
+  VERDICT=$(python3 -c "import json,sys; d=json.load(open(sys.argv[1])); print(d.get('verdict','fail'))" "$CLAUDE_OUT" 2>/dev/null || echo fail)
+  PASSED=$([ "$VERDICT" = "fail" ] && echo 0 || echo 1)
+  python3 "${CLAUDE_PLUGIN_ROOT}/scripts/anvil-ledger.py" insert-check \
+    --task-id "$TASK_ID" --phase review \
+    --check "review-claude" --tool "code-review-claude" \
+    --command "Task(subagent_type=claude-anvil:code-review-claude)" \
+    --exit-code 0 --passed "$PASSED" \
+    --output-file "$CLAUDE_OUT"
+fi
 ```
 
 The reviewer JSON schema (both Claude and external providers use the same schema):
@@ -443,6 +457,7 @@ After completing verification and learning, check whether any bugs were encounte
 - The ledger recorded `passed=0` for a check that should have run but didn't (e.g., due to a failed `&&` chain).
 - Any Bash command exited with an unexpected error that was not caused by user-introduced code changes.
 - An `Agent(...)` tool call returned an error (e.g., "Agent type not found", timeout, or any error key in the result) — even if a subsequent retry succeeded. A successful retry does not erase the defect in the instructions that caused the first failure.
+- The model inserted a manually-constructed stub verdict (i.e., JSON written by the model itself rather than by the reviewer agent) — regardless of whether the stub contains an `"error"` key. A self-constructed verdict is not a reviewer verdict; it is a coverage gap and should trigger this check. If the stub also contains an `"error"` key (matching the previous bullet), count it as **one** issue, not two.
 
 **Classify and offer:**
 
