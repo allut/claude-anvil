@@ -216,6 +216,8 @@ Stream output to the user so they see progress. After the pull, re-run `validate
 
 The `caveman` skill compresses `/anvil`'s free-form prose (Anvil's structured artifacts — Evidence Bundle, callouts, code, commits — stay verbatim). Default is **off** (current behavior).
 
+> **Prerequisite**: caveman is a separate skill, not bundled with claude-anvil. Install it first (`~/.claude/skills/caveman/`). If it's absent, your chosen level is still saved but `/anvil` falls back to normal prose until the skill is installed — enabling it here is harmless either way.
+
 `AskUserQuestion` "Compress /anvil's prose with caveman mode?":
 - `Off (default)` — keep full prose.
 - `Standard` — caveman English.

@@ -47,7 +47,7 @@ plugin/
 
 ## Key design invariants
 
-**anvil-config.py is the single owner of config.json.** Never write to it directly. Use the `save`, `set`, `set-caveman`, or `gui-key` subcommands. The schema carries a top-level `caveman` block (`{"enabled": false, "level": "full"}`) alongside `reviewers` and `roster`; `set-caveman LEVEL|off` is the only writer for it and `caveman` resolves the active level (env → config → `off`).
+**anvil-config.py is the single owner of config.json.** Never write to it directly. Use the `save`, `set`, `set-caveman`, or `gui-key` subcommands. The schema carries a top-level `caveman` block (`{"enabled": false, "level": "full"}`) alongside `reviewers` and `roster`; `set-caveman LEVEL|off` is the only writer for it and `caveman` resolves the active level (env → config → `off`). The `caveman` skill itself is an optional external dependency (not bundled with claude-anvil, lives at `~/.claude/skills/caveman/`); when it's absent `/anvil` degrades to normal prose regardless of the configured level.
 
 **anvil-ledger.py is the single owner of the SQLite DB.** Never shell out to raw `sqlite3`. All SQL goes through the ledger CLI.
 
