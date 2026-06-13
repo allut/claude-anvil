@@ -16,7 +16,8 @@ Schema (version 1):
         "ollama": {"enabled": false, "host": "http://localhost:11434",
                     "model": "qwen2.5-coder:7b"}
       },
-      "roster": {"medium": ["claude"], "large": ["claude", "gemini", "ollama"]}
+      "roster": {"medium": ["claude"], "large": ["claude", "gemini", "ollama"]},
+      "caveman": {"enabled": false, "level": "full"}
     }
 
 API keys are stored in the OS keychain when available:
@@ -43,6 +44,8 @@ Subcommands:
     set PROVIDER KEY=VALUE [KEY=VALUE]  -> merges into config; api_key goes to keychain
     validate PROVIDER                   -> tiny live HTTP probe; prints JSON status
     summary                             -> human-readable masked summary
+    caveman                             -> resolves env -> config; prints caveman level or "off"
+    set-caveman LEVEL|off               -> writes caveman.enabled/level into config.json
     keychain-status                     -> shows which backend is active and where each key lives
     keychain-delete PROVIDER            -> removes keychain entry for a provider's api_key
     create-shortcuts PLUGIN_ROOT        -> writes ~/.claude/commands/anvil.md and anvil-setup.md
@@ -71,6 +74,8 @@ from typing import Any
 DEFAULT_CONFIG_REL = "~/.claude-anvil/config.json"
 SCHEMA_VERSION = 1
 PROVIDERS = ("claude", "openai", "gemini", "ollama")
+VALID_CAVEMAN_LEVELS = ("lite", "full", "ultra", "wenyan-lite", "wenyan-full", "wenyan-ultra")
+CAVEMAN_DEFAULT_LEVEL = "full"
 HTTP_TIMEOUT = 15.0
 KEYCHAIN_SERVICE = "anvil"
 API_KEY_FIELDS = frozenset({"api_key"})
@@ -112,6 +117,7 @@ def default_config() -> dict[str, Any]:
             "medium": ["claude"],
             "large": ["claude", "gemini", "ollama"],
         },
+        "caveman": {"enabled": False, "level": CAVEMAN_DEFAULT_LEVEL},
     }
 
 
@@ -149,6 +155,11 @@ def merge_with_defaults(cfg: dict[str, Any]) -> dict[str, Any]:
     for k in ("medium", "large"):
         if isinstance(roster.get(k), list):
             out["roster"][k] = [r for r in roster[k] if isinstance(r, str)]
+    caveman = cfg.get("caveman")
+    if isinstance(caveman, dict):
+        out["caveman"]["enabled"] = bool(caveman.get("enabled", False))
+        level = caveman.get("level")
+        out["caveman"]["level"] = level if level in VALID_CAVEMAN_LEVELS else CAVEMAN_DEFAULT_LEVEL
     return out
 
 
@@ -371,6 +382,41 @@ def resolve_value(provider: str, key: str, env_var: str | None, default: str) ->
             else:
                 return raw
     return default
+
+
+# --- caveman output mode -----------------------------------------------------
+
+_CAVEMAN_OFF_TOKENS = frozenset({"off", "none", "disabled", ""})
+
+
+def resolve_caveman() -> str:
+    """Resolve the active caveman level.
+
+    Precedence (env wins, mirroring resolve_value): ANVIL_CAVEMAN_LEVEL env var ->
+    config.json caveman block -> "off". Returns a valid level string or "off".
+    An unknown env value prints a stderr warning and resolves to "off".
+    """
+    env = os.environ.get("ANVIL_CAVEMAN_LEVEL")
+    if env is not None:
+        val = env.strip().lower()
+        if val in _CAVEMAN_OFF_TOKENS:
+            return "off"
+        if val in VALID_CAVEMAN_LEVELS:
+            return val
+        print(
+            f"anvil-config: ANVIL_CAVEMAN_LEVEL={env!r} is not a valid level "
+            f"(expected one of {', '.join(VALID_CAVEMAN_LEVELS)} or off); treating as off",
+            file=sys.stderr,
+        )
+        return "off"
+    cfg = load_config()
+    if cfg:
+        merged = merge_with_defaults(cfg)
+        block = merged.get("caveman", {})
+        if block.get("enabled"):
+            level = block.get("level")
+            return level if level in VALID_CAVEMAN_LEVELS else CAVEMAN_DEFAULT_LEVEL
+    return "off"
 
 
 # --- HTTP probes -------------------------------------------------------------
@@ -875,6 +921,8 @@ def cmd_summary(_args: argparse.Namespace) -> int:
         print(f"  {name:<7} {flag}  {' '.join(bits)}")
     print(f"roster.medium:    {','.join(merged['roster'].get('medium', []))}")
     print(f"roster.large:     {','.join(merged['roster'].get('large', []))}")
+    caveman = merged.get("caveman", {})
+    print(f"caveman:          {caveman.get('level') if caveman.get('enabled') else 'off'}")
     return 0
 
 
@@ -915,6 +963,37 @@ def cmd_keychain_delete(args: argparse.Namespace) -> int:
             block["api_key"] = ""
             atomic_write(config_path(), json.dumps(merged, indent=2) + "\n")
     print(f"keychain entry for {args.provider} removed")
+    return 0
+
+
+def cmd_caveman(_args: argparse.Namespace) -> int:
+    """Print the active caveman level (env -> config), or 'off' when disabled/unset."""
+    print(resolve_caveman())
+    return 0
+
+
+def cmd_set_caveman(args: argparse.Namespace) -> int:
+    """Persist caveman mode into config.json. LEVEL is one of the valid levels, or 'off'."""
+    choice = args.level.strip().lower()
+    cfg = load_config() or default_config()
+    cfg = merge_with_defaults(cfg)
+    if choice in ("off", "none", "disabled"):
+        cfg["caveman"]["enabled"] = False
+    elif choice in VALID_CAVEMAN_LEVELS:
+        cfg["caveman"]["enabled"] = True
+        cfg["caveman"]["level"] = choice
+    else:
+        print(
+            f"anvil-config: invalid caveman level {args.level!r} "
+            f"(expected one of {', '.join(VALID_CAVEMAN_LEVELS)} or off)",
+            file=sys.stderr,
+        )
+        return 2
+    atomic_write(config_path(), json.dumps(cfg, indent=2) + "\n")
+    if cfg["caveman"]["enabled"]:
+        print(f"ok (caveman {cfg['caveman']['level']})")
+    else:
+        print("ok (caveman off)")
     return 0
 
 
@@ -1034,6 +1113,13 @@ def build_parser() -> argparse.ArgumentParser:
     v.set_defaults(func=cmd_validate)
 
     sub.add_parser("summary").set_defaults(func=cmd_summary)
+
+    sub.add_parser("caveman").set_defaults(func=cmd_caveman)
+
+    sc = sub.add_parser("set-caveman")
+    sc.add_argument("level", metavar="LEVEL|off",
+                    help="One of: " + ", ".join(VALID_CAVEMAN_LEVELS) + ", or off")
+    sc.set_defaults(func=cmd_set_caveman)
 
     sub.add_parser("keychain-status").set_defaults(func=cmd_keychain_status)
 

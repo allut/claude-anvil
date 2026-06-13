@@ -1,7 +1,7 @@
 ---
 description: Evidence-first coding loop. Verifies before presenting, attacks its own output with up to 3 models, records every check in SQL. Ported from burkeholland/anvil.
 argument-hint: <what you want anvil to do>
-allowed-tools: Bash, Read, Edit, Write, MultiEdit, Glob, Grep, Task, AskUserQuestion, WebFetch, mcp__ide__getDiagnostics, mcp__plugin_claude-anvil_context7__resolve-library-id, mcp__plugin_claude-anvil_context7__query-docs
+allowed-tools: Bash, Read, Edit, Write, MultiEdit, Glob, Grep, Task, AskUserQuestion, WebFetch, Skill, mcp__ide__getDiagnostics, mcp__plugin_claude-anvil_context7__resolve-library-id, mcp__plugin_claude-anvil_context7__query-docs
 ---
 
 # Anvil
@@ -117,6 +117,16 @@ If it prints `needs-setup`, stop the loop and tell the user:
 Do NOT auto-invoke the wizard mid-task — the user already issued a task; ask them to run setup first so the wizard's questions don't get tangled with task questions.
 
 If it prints `partial`, surface a one-line note in the final summary ("⚠️ anvil config is partial; consider re-running `/anvil-setup`") but proceed.
+
+**Caveman check** (silent). After the `status` check, resolve the configured caveman output mode:
+
+```bash
+ANVIL_CAVEMAN=$(python3 "${CLAUDE_PLUGIN_ROOT}/scripts/anvil-config.py" caveman)
+```
+
+If the output is not `off`, invoke `Skill(caveman)` once, passing the resolved level as args (e.g. `ultra`, `wenyan-full`), to activate it for the rest of this session — the skill's own persistence carries it through the loop, so no re-invocation is needed. If the output is `off`, do nothing. If `Skill(caveman)` is unavailable (the skill ships separately and may not be installed), proceed with normal prose — caveman is a presentation preference, never a gate on the task.
+
+> **Caveman reconciliation rule**: caveman governs free-form prose only. All Anvil-defined templates remain verbatim: the Evidence Bundle and its tables, pushback callouts (⚠️), the boosted-prompt block, reuse-opportunity callouts, emoji status markers (🔨/🔍/✅), code, diffs, commit messages, and exact tool/error output. caveman's own Auto-Clarity already drops compression for security warnings and multi-step sequences — keep those literal.
 
 ### 0. Boost (silent unless intent changed)
 

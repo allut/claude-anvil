@@ -47,13 +47,13 @@ plugin/
 
 ## Key design invariants
 
-**anvil-config.py is the single owner of config.json.** Never write to it directly. Use the `save`, `set`, or `gui-key` subcommands.
+**anvil-config.py is the single owner of config.json.** Never write to it directly. Use the `save`, `set`, `set-caveman`, or `gui-key` subcommands. The schema carries a top-level `caveman` block (`{"enabled": false, "level": "full"}`) alongside `reviewers` and `roster`; `set-caveman LEVEL|off` is the only writer for it and `caveman` resolves the active level (env → config → `off`).
 
 **anvil-ledger.py is the single owner of the SQLite DB.** Never shell out to raw `sqlite3`. All SQL goes through the ledger CLI.
 
 **API keys never appear in argv, shell args, or tool results.** On Windows they are DPAPI-encrypted and stored in config.json with a `dpapi:` prefix. On macOS/Linux they go to the OS keychain. `gui-key` collects them via a Tkinter password dialog.
 
-**Env vars win over config.json.** The full env var list is in `.env.example`. This is enforced in `anvil-config.py resolve_value()`.
+**Env vars win over config.json.** The full env var list is in `.env.example`. This is enforced in `anvil-config.py resolve_value()` (and `resolve_caveman()` for `ANVIL_CAVEMAN_LEVEL`, which overrides the config `caveman` block; valid levels are `lite/full/ultra/wenyan-lite/wenyan-full/wenyan-ultra`, and `off/none/disabled/empty` disables it).
 
 **`hooks/hooks.json` wires two hooks:**
 - `PreToolUse Bash` → `anvil-gate-commit.py` — blocks commits not issued by /anvil

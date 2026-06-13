@@ -212,6 +212,25 @@ ollama pull <chosen-model>
 ```
 Stream output to the user so they see progress. After the pull, re-run `validate ollama`. If it still reports `model-missing`, surface the failure and let the user pick a different model.
 
+### 6b. Configure caveman output mode
+
+The `caveman` skill compresses `/anvil`'s free-form prose (Anvil's structured artifacts — Evidence Bundle, callouts, code, commits — stay verbatim). Default is **off** (current behavior).
+
+`AskUserQuestion` "Compress /anvil's prose with caveman mode?":
+- `Off (default)` — keep full prose.
+- `Standard` — caveman English.
+- `Wényán 文言` — classical-Chinese caveman.
+
+If the user picked `Standard` or `Wényán`, ask a second `AskUserQuestion` "Pick the intensity":
+- Standard → `lite` / `full` / `ultra`
+- Wényán → `wenyan-lite` / `wenyan-full` / `wenyan-ultra`
+
+Always run `set-caveman` (pass `off` for the default choice) **before** Step 7's read-modify-save, so the saved config retains the caveman block (Step 7 rewrites only roster fields; `merge_with_defaults` preserves `caveman`):
+
+```bash
+python3 "${CLAUDE_PLUGIN_ROOT}/scripts/anvil-config.py" set-caveman <off|level>
+```
+
 ### 7. Derive rosters
 
 Compute roster fields based on what was enabled. Priority order: `claude > gemini > openai > ollama`.
@@ -250,6 +269,7 @@ Run `python3 "${CLAUDE_PLUGIN_ROOT}/scripts/anvil-config.py" summary` and presen
 - Which reviewers passed validation (`ok`/`skipped`/`unauthorized`/etc.)
 - The chosen Claude model (file `agents/code-review-claude.md` was rewritten on disk).
 - Roster: medium / large.
+- Caveman output mode (`off` or the chosen level — shown in the `caveman:` line of `summary`).
 - Rollback hint:
   > To redo setup later, run `/anvil-setup reset` or `rm ~/.claude-anvil/config.json`.
   > Note: `/anvil-setup reset` also removes any keychain entries. If you delete config.json manually, run `python3 scripts/anvil-config.py keychain-delete openai` and `keychain-delete gemini` to remove keychain entries too.
