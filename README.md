@@ -15,6 +15,7 @@ Your coding agent should prove its work. This one does.
 - **Session memory.** A PostToolUse hook tracks every file anvil edits. Next session, if you touch that file again, anvil recalls past failures and accounts for them.
 - **Git autopilot.** Checks git state, stashes uncommitted work, creates a branch, commits the result with a clean rollback command.
 - **Context7 docs.** Bundled MCP server fetches up-to-date library docs so anvil doesn't hallucinate APIs.
+- **Caveman mode (optional).** Compress `/anvil`'s prose ~75% via the separate `caveman` skill — structured artifacts (Evidence Bundle, pushback, code, commits) stay verbatim. Off by default; see **Caveman output mode** below.
 
 ## Requirements
 
@@ -90,6 +91,26 @@ Default roster after wizard: Medium = first enabled reviewer; Large = up to 3 en
 - **OpenRouter / Groq**: `HTTP-Referer` and `X-Title` attribution headers are sent unconditionally. If a free-tier model rejects `response_format: {type: json_object}`, the wizard's "JSON mode = off" toggle (or `ANVIL_OPENAI_JSON_MODE=off`) makes anvil fall back to extracting JSON from the reply body.
 
 A commit gate blocks `git commit` during an active `/anvil` session when the ledger is missing evidence in any of the three phases (baseline, after, review). Commits outside an anvil session are unaffected.
+
+### Caveman output mode (optional)
+
+Anvil can route its free-form prose through the `caveman` skill, which compresses chatter ~75% while keeping full technical accuracy. Anvil's **structured artifacts stay verbatim** — the Evidence Bundle and its tables, pushback callouts (⚠️), boosted prompts, reuse callouts, status markers (🔨/🔍/✅), code, diffs, and commit messages are never compressed. Security warnings and multi-step sequences also stay literal. It's purely a presentation preference and never gates the task.
+
+> **Prerequisite:** `caveman` is a *separate* skill, not bundled with claude-anvil. Install it to `~/.claude/skills/caveman/` first. If it's absent, your chosen level is still saved but `/anvil` falls back to normal prose until the skill is installed — enabling it is harmless either way.
+
+Two dialects, three intensities each:
+
+| Dialect | Levels | What it sounds like |
+|---|---|---|
+| **Standard** | `lite` / `full` / `ultra` | Caveman English (`full` is the default intensity) |
+| **Wényán 文言** | `wenyan-lite` / `wenyan-full` / `wenyan-ultra` | Classical-Chinese caveman |
+
+Enable it either way:
+
+- **Via the wizard:** `/anvil-setup` asks "Compress /anvil's prose with caveman mode?" and, if you opt in, the intensity.
+- **Via env var:** `ANVIL_CAVEMAN_LEVEL=ultra` (or any level above; `off`/`none`/`disabled` disables it). The env var wins over `config.json`, like every other `ANVIL_*` override.
+
+Default (unset) = **off**. Check the active level with `python scripts/anvil-config.py caveman` (prints the level or `off`).
 
 ## Use
 
