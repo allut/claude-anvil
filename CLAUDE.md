@@ -21,6 +21,7 @@ plugin/
   agents/
     code-review-claude.md      # subagent definition for the Claude adversarial reviewer
   scripts/
+    anvil_shared.py            # shared helpers (e.g. db_path) imported by ledger + hook scripts
     anvil-config.py            # owns ~/.claude-anvil/config.json; all config I/O
     anvil-ledger.py            # SQLite ledger + session memory CLI
     anvil-review.py            # dispatches review calls to OpenAI/Gemini/Ollama
