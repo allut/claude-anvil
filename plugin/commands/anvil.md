@@ -288,7 +288,7 @@ ls -la "$DIFF_FILE"
 
 **All variable assignments (`ANVIL_TMPDIR`, `DIFF_FILE`, `CLAUDE_OUT`) and the external reviewer Bash calls that reference them must be in a single Bash tool invocation.** Each Bash call runs in a fresh shell — variables set in one call are gone in the next. Either batch everything into one call, or re-resolve and echo the paths at the start of each subsequent call before using them.
 
-**Claude (Task subagent) is the ONLY reviewer you can spawn with a Claude model.** GPT / Gemini / Ollama are each invoked via a Bash call to `anvil-review.py`. Issue `Task` and `Bash` calls in the **same assistant turn** so they run in parallel.
+**Claude (Task subagent) is the ONLY reviewer you can spawn with a Claude model.** GPT / Gemini / Ollama are each invoked via a Bash call to `anvil-review.py`. Issue `Task` and `Bash` calls in the **same assistant turn** so they run in parallel. **The Bash call must be synchronous — do NOT pass `run_in_background=true`.** The Task is already non-blocking; a synchronous Bash alongside it achieves real parallelism. Adding `run_in_background` to the Bash call creates a background process the loop cannot wait for, which causes premature `reviewer-unavailable` stubs and false ledger rows.
 
 Roster selection is config-driven (env vars still win when set):
 
@@ -354,6 +354,8 @@ The reviewer JSON schema (both Claude and external providers use the same schema
 There is no `description` or `location` field. Use `what` and `file` for findings text and location.
 
 **External reviewer calls (Bash, run in parallel with the Task call):**
+
+**🚫 Do NOT pass `run_in_background=true` to this Bash call.** The Bash call is intentionally synchronous. `Task` (Claude reviewer) and this synchronous `Bash` (external providers) already execute in parallel within one assistant turn — `run_in_background` is not needed and breaks the loop. If the Bash call runs in background, the loop proceeds before `anvil-review.py` finishes, a stub verdict gets inserted into the ledger, and the real verdict (written seconds later) is never recorded.
 
 ```bash
 # anvil-review.py exits 0 on all provider errors (stub verdict written); || true suppresses all non-zero exits including
