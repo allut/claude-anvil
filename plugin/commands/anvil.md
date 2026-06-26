@@ -310,11 +310,13 @@ Before spawning the Task, read `$DIFF_FILE` and `$CLAUDE_OUT` from your Bash con
 
 **🚫 Do NOT pass `run_in_background=true` to the Claude reviewer Task.** The Task must be synchronous — the loop reads the verdict file immediately after `Task` returns. If the agent runs in background, the output file will not exist when you check for it, and any verdict you insert at that point is fabricated. If the output file is missing after `Task` returns (and no error was thrown), do NOT classify this as `reviewer-unavailable`. Instead: INSERT `--check review-loop-failure --passed 0` with an output explaining the gap, trigger step 6b, and do not commit.
 
+**🚫 The output-file guard (`[ -s "$CLAUDE_OUT" ]`) and all subsequent `insert-check` calls for the Claude reviewer MUST be in the same assistant turn as the `Task` call — not in a later Bash call.** The Task is synchronous within an assistant turn; the moment that turn ends, you lose all guarantees about timing. Checking the output file in a subsequent assistant turn races against the subagent: the file may still be in flight, causing a false `review-loop-failure` stub even though the reviewer actually succeeded. Do NOT defer the guard to a later turn. If you discover you are already in a subsequent turn when checking (i.e., the Task returned in a prior turn), do not attempt to read the output file — instead INSERT a `review-loop-failure` row explaining the deferred check and trigger step 6b; do not commit.
+
 Spawn the `claude-anvil:code-review-claude` subagent with this prompt (replacing the angle-bracket placeholders with the actual resolved strings from your Bash output):
 
 > task_id=`<TASK_ID>` diff_file=`<resolved value of $DIFF_FILE>` out_file=`<resolved value of $CLAUDE_OUT>`. Attack the diff. Find bugs, security issues, logic errors, race conditions, edge cases, missing error handling, and architectural violations. Ignore style. Write strict JSON to out_file per your system prompt, then print one `reviewer=claude ...` summary line.
 
-After the Task tool returns, **first check that the output file exists**. If it does not exist (and no error was thrown by the Task), do NOT run the normal verdict-reading INSERT — that would silently insert a fabricated `passed=0` row. Instead, INSERT a `review-loop-failure` row and trigger step 6b:
+After the Task tool returns (in the **same assistant turn**), **first check that the output file exists**. The `review-loop-failure` stub is only appropriate here — when the Task has returned within the current turn but the file was not written. If it does not exist (and no error was thrown by the Task), do NOT run the normal verdict-reading INSERT — that would silently insert a fabricated `passed=0` row. Instead, INSERT a `review-loop-failure` row and trigger step 6b:
 
 ```bash
 # Guard: only read the verdict if the file was actually written
