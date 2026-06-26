@@ -358,25 +358,25 @@ There is no `description` or `location` field. Use `what` and `file` for finding
 **🚫 Do NOT pass `run_in_background=true` to this Bash call.** The Bash call is intentionally synchronous. `Task` (Claude reviewer) and this synchronous `Bash` (external providers) already execute in parallel within one assistant turn — `run_in_background` is not needed and breaks the loop. If the Bash call runs in background, the loop proceeds before `anvil-review.py` finishes, a stub verdict gets inserted into the ledger, and the real verdict (written seconds later) is never recorded.
 
 ```bash
+# Loop over configured roster — never copy provider names here directly.
+# $ANVIL_LARGE was resolved above; "claude" is handled by the Task tool, skip it.
 # anvil-review.py exits 0 on all provider errors (stub verdict written); || true suppresses all non-zero exits including
 # exit 2 (diff file missing) — the /anvil loop reads the JSON "error" field to detect stub verdicts rather than relying on exit code
-python3 "${CLAUDE_PLUGIN_ROOT}/scripts/anvil-review.py" --provider gemini --task-id "$TASK_ID" --diff-file "$DIFF_FILE" || true
-python3 "${CLAUDE_PLUGIN_ROOT}/scripts/anvil-review.py" --provider ollama --task-id "$TASK_ID" --diff-file "$DIFF_FILE" || true
-python3 "${CLAUDE_PLUGIN_ROOT}/scripts/anvil-review.py" --provider openai --task-id "$TASK_ID" --diff-file "$DIFF_FILE" || true
-```
-
-After each reviewer finishes, read its JSON verdict and INSERT into the ledger:
-
-```bash
-VERDICT_FILE="$ANVIL_TMPDIR/anvil-review-gemini-$TASK_ID.json"
-VERDICT=$(python3 -c "import json,sys; d=json.load(open(sys.argv[1])); print(d.get('verdict','fail'))" "$VERDICT_FILE" 2>/dev/null || echo fail)
-PASSED=$([ "$VERDICT" = "fail" ] && echo 0 || echo 1)
-python3 "${CLAUDE_PLUGIN_ROOT}/scripts/anvil-ledger.py" insert-check \
-  --task-id "$TASK_ID" --phase review \
-  --check "review-gemini" --tool "anvil-review" \
-  --command "anvil-review.py --provider gemini" \
-  --exit-code 0 --passed "$PASSED" \
-  --output-file "$VERDICT_FILE"
+IFS=',' read -ra _PROVIDERS <<< "$ANVIL_LARGE"
+for _P in "${_PROVIDERS[@]}"; do
+    [ -z "$_P" ] && continue
+    [ "$_P" = "claude" ] && continue
+    python3 "${CLAUDE_PLUGIN_ROOT}/scripts/anvil-review.py" --provider "$_P" --task-id "$TASK_ID" --diff-file "$DIFF_FILE" || true
+    _VERDICT_FILE="$ANVIL_TMPDIR/anvil-review-${_P}-$TASK_ID.json"
+    _VERDICT=$(python3 -c "import json,sys; d=json.load(open(sys.argv[1])); print(d.get('verdict','fail'))" "$_VERDICT_FILE" 2>/dev/null || echo fail)
+    _PASSED=$([ "$_VERDICT" = "fail" ] && echo 0 || echo 1)
+    python3 "${CLAUDE_PLUGIN_ROOT}/scripts/anvil-ledger.py" insert-check \
+      --task-id "$TASK_ID" --phase review \
+      --check "review-${_P}" --tool "anvil-review" \
+      --command "anvil-review.py --provider ${_P}" \
+      --exit-code 0 --passed "$_PASSED" \
+      --output-file "$_VERDICT_FILE"
+done
 ```
 
 Use `check_name = review-<provider>` (e.g., `review-gemini`, `review-claude`) consistently. Reuse `$ANVIL_TMPDIR` for each provider without recomputing it.

@@ -294,6 +294,24 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--out", default=None)
     args = parser.parse_args(argv)
 
+    enabled = _setting(args.provider, "enabled", f"ANVIL_{args.provider.upper()}_ENABLED", "true")
+    if enabled.strip().lower() == "false":
+        out_path = Path(args.out) if args.out else default_out_path(args.provider, args.task_id)
+        stub = {
+            "provider": args.provider,
+            "model": _setting(args.provider, "model", f"ANVIL_{args.provider.upper()}_MODEL", ""),
+            "task_id": args.task_id,
+            "truncated": False,
+            "error": f"{args.provider} is disabled in config (enabled=false)",
+            "verdict": "pass",
+            "summary": f"{args.provider} skipped (enabled=false); no findings",
+            "findings": [],
+        }
+        out_path.parent.mkdir(parents=True, exist_ok=True)
+        out_path.write_text(json.dumps(stub, indent=2), encoding="utf-8")
+        print(f"reviewer={args.provider} verdict=pass findings=0 model=disabled out={out_path}")
+        return 0
+
     diff_path = Path(args.diff_file)
     if not diff_path.exists():
         print(f"anvil-review: diff file not found: {diff_path}", file=sys.stderr)
