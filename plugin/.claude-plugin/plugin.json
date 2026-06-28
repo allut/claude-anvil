@@ -1,6 +1,6 @@
 {
   "name": "claude-anvil",
-  "version": "0.1.13",
+  "version": "0.1.14",
   "description": "Evidence-first coding agent for Claude Code CLI. Verifies every change with adversarial multi-model review (Claude, GPT, Gemini, Ollama), SQL-tracked verification ledger, and automatic rollback. Port of burkeholland/anvil.",
   "author": {
     "name": "Aleksei Lutkov",
