@@ -308,22 +308,26 @@ Before spawning the Task, read `$DIFF_FILE` and `$CLAUDE_OUT` from your Bash con
 **❌ Wrong (guessed path):** `diff_file=/tmp/anvil-diff-my-task.patch`
 **✅ Correct (resolved value):** `diff_file=/var/folders/j5/abc123/T/anvil-diff-my-task.patch`
 
-**🚫 Do NOT pass `run_in_background=true` to the Claude reviewer Task.** The Task must be synchronous — the loop reads the verdict file immediately after `Task` returns. If the agent runs in background, the output file will not exist when you check for it, and any verdict you insert at that point is fabricated. If the output file is missing after `Task` returns (and no error was thrown), do NOT classify this as `reviewer-unavailable`. Instead: INSERT `--check review-loop-failure --passed 0` with an output explaining the gap, trigger step 6b, and do not commit.
-
-**🚫 The output-file guard (`[ -s "$CLAUDE_OUT" ]`) and all subsequent `insert-check` calls for the Claude reviewer MUST be in the same assistant turn as the `Task` call — not in a later Bash call.** The Task is synchronous within an assistant turn; the moment that turn ends, you lose all guarantees about timing. Checking the output file in a subsequent assistant turn races against the subagent: the file may still be in flight, causing a false `review-loop-failure` stub even though the reviewer actually succeeded. Do NOT defer the guard to a later turn. If you discover you are already in a subsequent turn when checking (i.e., the Task returned in a prior turn), do not attempt to read the output file — instead INSERT a `review-loop-failure` row explaining the deferred check and trigger step 6b; do not commit.
+**The `Agent`/`Task` tool always returns immediately** — it never blocks until the subagent finishes. The subagent runs asynchronously and writes its output file later, when the system fires a task-notification that re-invokes the loop. Do NOT check for the output file in the same assistant turn that spawned the Task — the file will not exist yet, and inserting a verdict at that point is fabricated.
 
 Spawn the `claude-anvil:code-review-claude` subagent with this prompt (replacing the angle-bracket placeholders with the actual resolved strings from your Bash output):
 
 > task_id=`<TASK_ID>` diff_file=`<resolved value of $DIFF_FILE>` out_file=`<resolved value of $CLAUDE_OUT>`. Attack the diff. Find bugs, security issues, logic errors, race conditions, edge cases, missing error handling, and architectural violations. Ignore style. Write strict JSON to out_file per your system prompt, then print one `reviewer=claude ...` summary line.
 
-After the Task tool returns (in the **same assistant turn**), **first check that the output file exists**. The `review-loop-failure` stub is only appropriate here — when the Task has returned within the current turn but the file was not written. If it does not exist (and no error was thrown by the Task), do NOT run the normal verdict-reading INSERT — that would silently insert a fabricated `passed=0` row. Instead, INSERT a `review-loop-failure` row and trigger step 6b:
+**Do NOT check the output file in the same turn that spawned the Task.** The subagent hasn't run yet. Instead:
+
+- **In the spawning turn**: issue the Task call and the external-reviewer Bash call in the same turn (parallel). If the Task tool itself returns an error (not just a missing output file), INSERT a `review-loop-failure` row immediately in the spawning turn and trigger step 6b. Otherwise, the synchronous Bash call returns with external verdicts — insert them. Do not attempt to read `$CLAUDE_OUT` in this turn; it does not exist yet. All of 5d / 5e / 6 / 7 / 8 require the Claude verdict, so leave them for the notification turn.
+- **When the task-notification arrives** (a new assistant turn triggered by the system): THAT is when you check the file and insert the verdict. Shell variables don't persist between turns — re-resolve `ANVIL_TMPDIR` via `python3` and substitute the **literal task_id string** (e.g. `fix-login-crash`) directly into `CLAUDE_OUT`, not the variable name `$TASK_ID`. After inserting the Claude verdict, continue to 5d / 5e / 6 / 7 / 8 normally.
 
 ```bash
-# Guard: only read the verdict if the file was actually written
+# Notification-handler turn — substitute literal task_id, e.g. "fix-anvil-async-reviewer"
+ANVIL_TMPDIR=$(python3 -c "import tempfile; print(tempfile.gettempdir())")
+CLAUDE_OUT="$ANVIL_TMPDIR/anvil-review-claude-<LITERAL_TASK_ID>.json"
+
 if [ ! -s "$CLAUDE_OUT" ]; then
-  printf '{"verdict":"fail","summary":"review-loop-failure: output file not written after synchronous Task returned","findings":[]}' > "$CLAUDE_OUT"
+  printf '{"verdict":"fail","summary":"review-loop-failure: output file not written when notification arrived","findings":[]}' > "$CLAUDE_OUT"
   python3 "${CLAUDE_PLUGIN_ROOT}/scripts/anvil-ledger.py" insert-check \
-    --task-id "$TASK_ID" --phase review \
+    --task-id "<LITERAL_TASK_ID>" --phase review \
     --check "review-loop-failure" --tool "code-review-claude" \
     --command "Task(subagent_type=claude-anvil:code-review-claude)" \
     --exit-code 1 --passed 0 \
@@ -333,13 +337,15 @@ else
   VERDICT=$(python3 -c "import json,sys; d=json.load(open(sys.argv[1])); print(d.get('verdict','fail'))" "$CLAUDE_OUT" 2>/dev/null || echo fail)
   PASSED=$([ "$VERDICT" = "fail" ] && echo 0 || echo 1)
   python3 "${CLAUDE_PLUGIN_ROOT}/scripts/anvil-ledger.py" insert-check \
-    --task-id "$TASK_ID" --phase review \
+    --task-id "<LITERAL_TASK_ID>" --phase review \
     --check "review-claude" --tool "code-review-claude" \
     --command "Task(subagent_type=claude-anvil:code-review-claude)" \
     --exit-code 0 --passed "$PASSED" \
     --output-file "$CLAUDE_OUT"
 fi
 ```
+
+The `review-loop-failure` stub is written: (a) in the spawning turn only when the Task tool call itself returned an error; (b) in the notification-handler turn when the notification arrived but the file was still not written. Never insert a stub for a missing file in the spawning turn — the file doesn't exist yet by design.
 
 The reviewer JSON schema (both Claude and external providers use the same schema):
 
