@@ -181,13 +181,16 @@ def normalize_verdict(raw: dict | None, fallback_summary: str) -> dict:
     }
 
 
+# Transient upstream failures worth retrying (rate limits, gateway/overload errors).
+_RETRYABLE_HTTP_STATUSES = {429, 500, 502, 503, 504}
+_MAX_HTTP_ATTEMPTS = 3
+_HTTP_RETRY_BASE_SECONDS = 2.0
+
+
 def http_post_json(url: str, payload: dict, headers: dict, timeout: float = 180.0) -> dict:
     import ssl
+    import time
     body = json.dumps(payload).encode("utf-8")
-    req = urllib.request.Request(url, data=body, method="POST")
-    req.add_header("Content-Type", "application/json")
-    for k, v in headers.items():
-        req.add_header(k, v)
     try:
         import certifi
         _ctx: ssl.SSLContext | None = ssl.create_default_context(cafile=certifi.where())
@@ -197,8 +200,31 @@ def http_post_json(url: str, payload: dict, headers: dict, timeout: float = 180.
         _ctx = None
     except Exception:
         _ctx = None
-    with urllib.request.urlopen(req, timeout=timeout, context=_ctx) as resp:
-        return json.loads(resp.read().decode("utf-8", errors="replace"))
+
+    for attempt in range(1, _MAX_HTTP_ATTEMPTS + 1):
+        req = urllib.request.Request(url, data=body, method="POST")
+        req.add_header("Content-Type", "application/json")
+        for k, v in headers.items():
+            req.add_header(k, v)
+        try:
+            with urllib.request.urlopen(req, timeout=timeout, context=_ctx) as resp:
+                return json.loads(resp.read().decode("utf-8", errors="replace"))
+        except urllib.error.HTTPError as e:
+            if e.code not in _RETRYABLE_HTTP_STATUSES or attempt == _MAX_HTTP_ATTEMPTS:
+                raise
+            retry_after = e.headers.get("Retry-After") if e.headers else None
+            delay = (
+                float(retry_after)
+                if retry_after and retry_after.strip().isdigit()
+                else _HTTP_RETRY_BASE_SECONDS * (2 ** (attempt - 1))
+            )
+            print(
+                f"anvil-review: HTTP {e.code} (attempt {attempt}/{_MAX_HTTP_ATTEMPTS}), "
+                f"retrying in {delay:.0f}s",
+                file=sys.stderr,
+            )
+            time.sleep(delay)
+    raise AssertionError("unreachable")  # loop always returns or raises
 
 
 # ---------- provider calls ---------------------------------------------------
