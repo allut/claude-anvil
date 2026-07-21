@@ -44,7 +44,7 @@ plugin/
 - `$ANVIL_TMPDIR/anvil-diff-<task_id>.patch` — staged diff snapshot used by reviewers (resolved via `python -c "import tempfile; print(tempfile.gettempdir())"` — on Windows this is `%LOCALAPPDATA%\Temp`, not MSYS2's `/tmp`)
 - `$ANVIL_TMPDIR/anvil-review-<provider>-<task_id>.json` — per-reviewer JSON verdicts (same temp dir)
 
-> **Note**: After editing any file under `plugin/commands/`, re-run `create-shortcuts` to sync the installed copies: `python plugin/scripts/anvil-config.py create-shortcuts "<plugin-root>"`. Stale shortcuts are the most common source of Windows `/tmp` path bugs.
+> **Note**: After editing any file under `plugin/commands/`, re-run `create-shortcuts` to sync the installed copies: `python plugin/scripts/anvil-config.py create-shortcuts` (resolves the installed `~/.claude-anvil/plugin-root` junction automatically). Stale shortcuts are the most common source of Windows `/tmp` path bugs.
 
 ## Key design invariants
 

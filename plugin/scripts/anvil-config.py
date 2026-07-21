@@ -48,9 +48,11 @@ Subcommands:
     set-caveman LEVEL|off               -> writes caveman.enabled/level into config.json
     keychain-status                     -> shows which backend is active and where each key lives
     keychain-delete PROVIDER            -> removes keychain entry for a provider's api_key
-    create-shortcuts PLUGIN_ROOT        -> writes ~/.claude/commands/anvil.md and anvil-setup.md
+    create-shortcuts [PLUGIN_ROOT]      -> writes ~/.claude/commands/anvil.md and anvil-setup.md
                                            with ${CLAUDE_PLUGIN_ROOT} replaced by a stable symlink;
-                                           also creates ~/.claude-anvil/plugin-root junction/symlink
+                                           also creates ~/.claude-anvil/plugin-root junction/symlink.
+                                           PLUGIN_ROOT optional: if omitted or invalid, falls back
+                                           to the installed ~/.claude-anvil/plugin-root junction
 """
 from __future__ import annotations
 
@@ -1018,19 +1020,60 @@ def _strip_context7_tools(content: str) -> str:
     return _ALLOWED_TOOLS_RE.sub(_replace, content)
 
 
+def _has_shortcut_sources(candidate: Path) -> bool:
+    """A candidate plugin root is valid only if both command sources exist under it."""
+    return all((candidate / "commands" / name).exists()
+               for name in ("anvil.md", "anvil-setup.md"))
+
+
+def _resolve_plugin_root(arg: str | None, stable_link: Path) -> Path | None:
+    """Resolve the plugin root, falling back to the installed junction.
+
+    Tries, in order:
+      1. The provided arg (if non-empty) -> Path(arg).resolve().
+      2. The realpath of the existing plugin-root junction/symlink.
+    Returns the first candidate that actually contains the command sources, or
+    None if neither is valid. When a non-empty arg is invalid but the junction
+    fallback works, prints an informational note to stderr (don't silently mask
+    a wrong path).
+    """
+    arg_stripped = (arg or "").strip()
+    if arg_stripped:
+        candidate = Path(arg_stripped).resolve()
+        if _has_shortcut_sources(candidate):
+            return candidate
+
+    # Fallback: the realpath of the existing junction, read while it still
+    # points at the real target (resolution happens before we delete/recreate it).
+    if stable_link.exists() or stable_link.is_symlink():
+        fallback = Path(os.path.realpath(stable_link))
+        if _has_shortcut_sources(fallback):
+            if arg_stripped:
+                print(f"anvil-config: '{arg_stripped}' is not a valid plugin root; "
+                      f"falling back to installed junction {fallback}", file=sys.stderr)
+            return fallback
+
+    return None
+
+
 def cmd_create_shortcuts(args: argparse.Namespace) -> int:
-    plugin_root = Path(args.plugin_root).resolve()
     stable_link = Path(os.path.expanduser("~/.claude-anvil/plugin-root"))
     commands_dir = Path(os.path.expanduser("~/.claude/commands"))
 
-    # --- validate sources before touching the filesystem ---
-    sources: list[tuple[str, Path]] = []
-    for name in ("anvil.md", "anvil-setup.md"):
-        src = plugin_root / "commands" / name
-        if not src.exists():
-            print(f"anvil-config: source not found: {src}", file=sys.stderr)
-            return 1
-        sources.append((name, src))
+    # --- resolve + validate the plugin root before touching the filesystem ---
+    # Must run before the junction is deleted/recreated below, so the realpath
+    # fallback reads the junction while it still points at the real target.
+    plugin_root = _resolve_plugin_root(getattr(args, "plugin_root", None), stable_link)
+    if plugin_root is None:
+        print("anvil-config: could not resolve plugin root; pass the plugin dir "
+              'explicitly, e.g. create-shortcuts "C:/path/to/claude-anvil/plugin"',
+              file=sys.stderr)
+        return 1
+
+    sources: list[tuple[str, Path]] = [
+        (name, plugin_root / "commands" / name)
+        for name in ("anvil.md", "anvil-setup.md")
+    ]
 
     # --- create/replace the stable plugin-root junction/symlink ---
     stable_link.parent.mkdir(parents=True, exist_ok=True)
@@ -1136,8 +1179,10 @@ def build_parser() -> argparse.ArgumentParser:
     gk.set_defaults(func=cmd_gui_key)
 
     cs = sub.add_parser("create-shortcuts")
-    cs.add_argument("plugin_root", metavar="PLUGIN_ROOT",
-                    help="Absolute path to the plugin root (value of ${CLAUDE_PLUGIN_ROOT})")
+    cs.add_argument("plugin_root", metavar="PLUGIN_ROOT", nargs="?", default=None,
+                    help="Absolute path to the plugin root (value of ${CLAUDE_PLUGIN_ROOT}). "
+                         "If omitted or invalid, falls back to the installed "
+                         "~/.claude-anvil/plugin-root junction.")
     cs.set_defaults(func=cmd_create_shortcuts)
 
     return p
