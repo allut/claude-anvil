@@ -23,7 +23,11 @@ Usage:
 
 Output:
     - Stdout: one line, e.g. "reviewer=openai verdict=pass findings=0 model=gpt-4o"
-    - File:   the full JSON verdict (plus metadata) at --out
+    - File:   the full JSON verdict (plus metadata) at --out. Includes a top-level
+              "passed" (0|1) machine signal for the ledger: 0 for a real
+              stub/outage (error set and verdict != "pass") or a "fail" verdict,
+              1 for genuine pass/concern and the intentional disabled-skip stub.
+              See compute_passed().
     - Exit 0 always when a verdict file was written (real or stub).
     - Exit 2 if the diff file is missing (no verdict can be produced).
     Callers distinguish real from stub verdicts via the "error" field in the JSON output.
@@ -163,6 +167,24 @@ def extract_json(text: str) -> dict | None:
                     except json.JSONDecodeError:
                         start = -1
     return None
+
+
+def compute_passed(verdict: str, error: str | None) -> int:
+    """Machine signal for the ledger `passed` flag.
+
+    Returns 0 when the review did not genuinely succeed:
+      - verdict == "fail" (a real high-severity failure), OR
+      - an error occurred AND the verdict is not "pass" (a stub/outage:
+        bad model slug, auth failure, unreachable host — these fall through
+        normalize_verdict to "concern"/"fail", never "pass").
+    Returns 1 otherwise, which includes the intentional disabled-skip stub
+    (error set but verdict pinned to "pass") and all genuine pass/concern verdicts.
+    """
+    if verdict == "fail":
+        return 0
+    if error and verdict != "pass":
+        return 0
+    return 1
 
 
 def normalize_verdict(raw: dict | None, fallback_summary: str) -> dict:
@@ -332,6 +354,7 @@ def main(argv: list[str] | None = None) -> int:
             "verdict": "pass",
             "summary": f"{args.provider} skipped (enabled=false); no findings",
             "findings": [],
+            "passed": compute_passed("pass", f"{args.provider} is disabled in config (enabled=false)"),
         }
         out_path.parent.mkdir(parents=True, exist_ok=True)
         out_path.write_text(json.dumps(stub, indent=2), encoding="utf-8")
@@ -371,6 +394,17 @@ def main(argv: list[str] | None = None) -> int:
     except Exception as e:  # noqa: BLE001 -- catch-all keeps the /anvil loop alive
         error = f"{args.provider} error: {e!r}"
 
+    # An HTTP call can succeed yet yield no genuine verdict object: the model
+    # emitted garbage/truncated JSON, ignored json_mode/format=json, or wrapped the
+    # verdict in an array so extract_json returned a non-dict. In all these shapes no
+    # exception fires, so `error` stays None and normalize_verdict defaults to
+    # "concern" — indistinguishable from a genuine clean review. Require a non-empty
+    # dict here (an empty {} from a failed parse, or a truthy non-dict like an
+    # array-wrapped verdict, both mean "no verdict") so compute_passed() flags every
+    # such reply (passed=0) like any other stub/outage.
+    if error is None and not (isinstance(raw, dict) and raw):
+        error = f"{args.provider} returned no parseable JSON verdict"
+
     fallback_summary = error or "reviewer returned no parseable verdict"
     verdict = normalize_verdict(raw, fallback_summary)
     record = {
@@ -380,6 +414,7 @@ def main(argv: list[str] | None = None) -> int:
         "truncated": truncated,
         "error": error,
         **verdict,
+        "passed": compute_passed(verdict["verdict"], error),
     }
 
     out_path.parent.mkdir(parents=True, exist_ok=True)

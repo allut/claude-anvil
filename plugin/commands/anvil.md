@@ -376,8 +376,11 @@ for _P in "${_PROVIDERS[@]}"; do
     [ "$_P" = "claude" ] && continue
     python3 "${CLAUDE_PLUGIN_ROOT}/scripts/anvil-review.py" --provider "$_P" --task-id "$TASK_ID" --diff-file "$DIFF_FILE" || true
     _VERDICT_FILE="$ANVIL_TMPDIR/anvil-review-${_P}-$TASK_ID.json"
-    _VERDICT=$(python3 -c "import json,sys; d=json.load(open(sys.argv[1])); print(d.get('verdict','fail'))" "$_VERDICT_FILE" 2>/dev/null || echo fail)
-    _PASSED=$([ "$_VERDICT" = "fail" ] && echo 0 || echo 1)
+    _PASSED=$(python3 -c "import json,sys
+d=json.load(open(sys.argv[1]))
+p=d.get('passed')
+if p is None: p = 0 if d.get('verdict','fail')=='fail' else 1
+print(int(p))" "$_VERDICT_FILE" 2>/dev/null || echo 0)
     python3 "${CLAUDE_PLUGIN_ROOT}/scripts/anvil-ledger.py" insert-check \
       --task-id "$TASK_ID" --phase review \
       --check "review-${_P}" --tool "anvil-review" \
