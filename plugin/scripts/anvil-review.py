@@ -31,16 +31,26 @@ Output:
     - Exit 0 always when a verdict file was written (real or stub).
     - Exit 2 if the diff file is missing (no verdict can be produced).
     Callers distinguish real from stub verdicts via the "error" field in the JSON output.
+
+Timeouts:
+    Every HTTP call is bounded by two true wall-clock deadlines, so a stalled
+    provider always returns control instead of hanging the /anvil loop:
+      ANVIL_REVIEW_HTTP_TIMEOUT   seconds per attempt   (default 180)
+      ANVIL_REVIEW_TOTAL_TIMEOUT  seconds per call,     (default 420)
+                                  covering all retries + backoff sleeps
+    Exceeding either produces a TimeoutError, which becomes a graceful stub verdict.
 """
 from __future__ import annotations
 
 import argparse
 import json
+import math
 import os
 import re
 import subprocess
 import sys
 import tempfile
+import threading
 import urllib.error
 import urllib.request
 from pathlib import Path
@@ -75,6 +85,34 @@ def _setting(provider: str, key: str, env_var: str, default: str = "") -> str:
     except Exception:
         pass
     return default
+
+def _provider_enabled(provider: str) -> bool:
+    """Is this reviewer switched on? anvil-config.py owns the answer.
+
+    Deliberately does NOT read ANVIL_<PROVIDER>_ENABLED here: `anvil-config.py get
+    <provider> enabled` is the single validated resolver for that flag (it applies the
+    env-wins rule, canonicalizes to "true"/"false", and warns on non-boolean values).
+    Duplicating the parsing locally is how the two sides drift apart. Child stderr is
+    forwarded so those warnings actually reach the user.
+
+    Fails open (True) when the helper can't be run — an unreachable config script must
+    never silently skip a reviewer and fabricate a clean verdict.
+    """
+    script = _SCRIPT_DIR / "anvil-config.py"
+    try:
+        r = subprocess.run(
+            [sys.executable, str(script), "get", provider, "enabled", "--default", "true"],
+            capture_output=True, timeout=20, text=True,
+        )
+    except Exception:
+        return True
+    if r.stderr.strip():
+        print(r.stderr.strip(), file=sys.stderr)
+    if r.returncode != 0:
+        return True
+    lines = [ln for ln in r.stdout.splitlines() if ln.strip()]
+    return lines[-1].strip().lower() != "false" if lines else True
+
 
 SHARED_PROMPT = (
     "You are a senior code reviewer performing an adversarial review.\n"
@@ -207,11 +245,84 @@ def normalize_verdict(raw: dict | None, fallback_summary: str) -> dict:
 _RETRYABLE_HTTP_STATUSES = {429, 500, 502, 503, 504}
 _MAX_HTTP_ATTEMPTS = 3
 _HTTP_RETRY_BASE_SECONDS = 2.0
+# Wall-clock deadlines. ATTEMPT bounds a single request; TOTAL bounds the whole
+# http_post_json call (every attempt plus the backoff sleeps between them).
+_DEFAULT_ATTEMPT_TIMEOUT = 180.0
+_DEFAULT_TOTAL_TIMEOUT = 420.0
 
 
-def http_post_json(url: str, payload: dict, headers: dict, timeout: float = 180.0) -> dict:
+def _env_float(name: str, default: float) -> float:
+    """Read a positive float from the environment, falling back to default on junk."""
+    raw = os.environ.get(name, "").strip()
+    if not raw:
+        return default
+    try:
+        value = float(raw)
+    except ValueError:
+        print(f"anvil-review: {name}={raw!r} is not a number; using {default:.0f}s", file=sys.stderr)
+        return default
+    # float() happily accepts "nan" and "inf"; both survive a `<= 0` test and then blow
+    # up later inside Thread.join() with ValueError/OverflowError.
+    if not math.isfinite(value) or value <= 0:
+        print(f"anvil-review: {name}={raw!r} must be a finite number > 0; "
+              f"using {default:.0f}s", file=sys.stderr)
+        return default
+    return value
+
+
+def _call_with_deadline(fn, deadline: float):
+    """Run fn() on a daemon thread and abandon it if it exceeds `deadline` seconds.
+
+    Why this exists: urllib's `timeout=` is a *per-socket-operation* timeout, not a
+    total deadline. An upstream that keeps the connection alive and trickles bytes
+    (common on queued free-tier inference endpoints) can run far past the configured
+    timeout without any single recv() exceeding it, so socket.timeout never fires and
+    the call never returns. This wrapper gives the caller a true wall-clock bound and
+    raises TimeoutError, which main()'s existing handler turns into a stub verdict.
+
+    The worker is a plain daemon threading.Thread on purpose:
+      - Python cannot kill a thread, so on expiry it is abandoned, not stopped. Daemon
+        status means an abandoned thread never blocks interpreter shutdown.
+      - concurrent.futures.ThreadPoolExecutor is deliberately NOT used: its atexit
+        handler joins worker threads, which would hang the process on a stuck socket —
+        exactly the failure this function exists to prevent.
+    """
+    box: dict = {}
+
+    def _runner() -> None:
+        try:
+            box["value"] = fn()
+        except BaseException as exc:  # noqa: BLE001 -- ferried to the caller verbatim
+            box["error"] = exc
+
+    worker = threading.Thread(target=_runner, daemon=True)
+    worker.start()
+    worker.join(deadline)
+    if worker.is_alive():
+        raise TimeoutError(f"request exceeded {deadline:.0f}s wall-clock deadline")
+    if "error" in box:
+        raise box["error"]
+    return box.get("value")
+
+
+def http_post_json(url: str, payload: dict, headers: dict,
+                   timeout: float | None = None,
+                   total_timeout: float | None = None) -> dict:
     import ssl
     import time
+    attempt_timeout = (
+        timeout if timeout is not None
+        else _env_float("ANVIL_REVIEW_HTTP_TIMEOUT", _DEFAULT_ATTEMPT_TIMEOUT)
+    )
+    budget = (
+        total_timeout if total_timeout is not None
+        else _env_float("ANVIL_REVIEW_TOTAL_TIMEOUT", _DEFAULT_TOTAL_TIMEOUT)
+    )
+    started = time.monotonic()
+
+    def _remaining() -> float:
+        return budget - (time.monotonic() - started)
+
     body = json.dumps(payload).encode("utf-8")
     try:
         import certifi
@@ -224,13 +335,25 @@ def http_post_json(url: str, payload: dict, headers: dict, timeout: float = 180.
         _ctx = None
 
     for attempt in range(1, _MAX_HTTP_ATTEMPTS + 1):
+        remaining = _remaining()
+        if remaining <= 0:
+            raise TimeoutError(
+                f"total {budget:.0f}s wall-clock budget exhausted after {attempt - 1} attempt(s)"
+            )
+        deadline = min(attempt_timeout, remaining)
         req = urllib.request.Request(url, data=body, method="POST")
         req.add_header("Content-Type", "application/json")
         for k, v in headers.items():
             req.add_header(k, v)
-        try:
-            with urllib.request.urlopen(req, timeout=timeout, context=_ctx) as resp:
+
+        def _do_request(_req=req, _deadline=deadline) -> dict:
+            # Socket-level timeout is still set as a first line of defence; the
+            # surrounding _call_with_deadline is what actually guarantees a return.
+            with urllib.request.urlopen(_req, timeout=_deadline, context=_ctx) as resp:
                 return json.loads(resp.read().decode("utf-8", errors="replace"))
+
+        try:
+            return _call_with_deadline(_do_request, deadline)
         except urllib.error.HTTPError as e:
             if e.code not in _RETRYABLE_HTTP_STATUSES or attempt == _MAX_HTTP_ATTEMPTS:
                 raise
@@ -240,6 +363,10 @@ def http_post_json(url: str, payload: dict, headers: dict, timeout: float = 180.
                 if retry_after and retry_after.strip().isdigit()
                 else _HTTP_RETRY_BASE_SECONDS * (2 ** (attempt - 1))
             )
+            if delay >= _remaining():
+                # No budget left to sleep and retry — surface the upstream error itself,
+                # which is more informative than a timeout.
+                raise
             print(
                 f"anvil-review: HTTP {e.code} (attempt {attempt}/{_MAX_HTTP_ATTEMPTS}), "
                 f"retrying in {delay:.0f}s",
@@ -342,8 +469,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--out", default=None)
     args = parser.parse_args(argv)
 
-    enabled = _setting(args.provider, "enabled", f"ANVIL_{args.provider.upper()}_ENABLED", "true")
-    if enabled.strip().lower() == "false":
+    if not _provider_enabled(args.provider):
         out_path = Path(args.out) if args.out else default_out_path(args.provider, args.task_id)
         stub = {
             "provider": args.provider,

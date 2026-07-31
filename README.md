@@ -85,10 +85,20 @@ Default roster after wizard: Medium = first enabled reviewer; Large = up to 3 en
 
 **Power users:** any `ANVIL_*` env var still wins over `config.json`, so the legacy `.env`-based flow keeps working — see `.env.example` for the full list. The dispatcher (`anvil-review.py`) reads env first, then `config.json`, then defaults.
 
+**Turning a reviewer off** doesn't require the wizard or re-entering credentials:
+
+```bash
+python scripts/anvil-config.py disable openai   # off + removed from both rosters
+python scripts/anvil-config.py enable  openai   # back on, same key/endpoint/model
+```
+
+`disable` only flips the `enabled` flag and prunes roster membership — `api_key`, `endpoint`, and `model` are preserved, so re-enabling is a one-liner. The env override `ANVIL_OPENAI_ENABLED=false` (any provider, `true/1/yes/on` vs `false/0/no/off`) does the same thing per-shell and, as always, wins over `config.json`.
+
 **Provider quirks handled automatically:**
 
 - **GPT-5 and o1/o3**: the `temperature` field is omitted (those models reject anything but `1`).
 - **OpenRouter / Groq**: `HTTP-Referer` and `X-Title` attribution headers are sent unconditionally. If a free-tier model rejects `response_format: {type: json_object}`, the wizard's "JSON mode = off" toggle (or `ANVIL_OPENAI_JSON_MODE=off`) makes anvil fall back to extracting JSON from the reply body.
+- **Slow or queued endpoints**: every reviewer HTTP call is bounded by two true wall-clock deadlines — `ANVIL_REVIEW_HTTP_TIMEOUT` per attempt (default `180`s) and `ANVIL_REVIEW_TOTAL_TIMEOUT` for the whole call including retries (default `420`s). A provider that stalls mid-response yields a graceful stub verdict instead of hanging the loop.
 
 A commit gate blocks `git commit` during an active `/anvil` session when the ledger is missing evidence in any of the three phases (baseline, after, review). Commits outside an anvil session are unaffected.
 

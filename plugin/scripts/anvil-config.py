@@ -42,6 +42,10 @@ Subcommands:
     roster {medium,large}               -> comma-separated reviewer list
     save                                -> reads JSON config from stdin and writes it (atomic, chmod 0600)
     set PROVIDER KEY=VALUE [KEY=VALUE]  -> merges into config; api_key goes to keychain
+    enable PROVIDER                     -> turns a reviewer on and adds it to the rosters
+    disable PROVIDER                    -> turns a reviewer off and drops it from the rosters;
+                                           credentials/endpoint/model are left untouched, so
+                                           re-enabling needs no re-entry of the API key
     validate PROVIDER                   -> tiny live HTTP probe; prints JSON status
     summary                             -> human-readable masked summary
     caveman                             -> resolves env -> config; prints caveman level or "off"
@@ -76,6 +80,8 @@ from typing import Any
 DEFAULT_CONFIG_REL = "~/.claude-anvil/config.json"
 SCHEMA_VERSION = 1
 PROVIDERS = ("claude", "openai", "gemini", "ollama")
+# Preference order used when picking reviewers without an explicit roster entry.
+ROSTER_PRIORITY = ("claude", "gemini", "openai", "ollama")
 VALID_CAVEMAN_LEVELS = ("lite", "full", "ultra", "wenyan-lite", "wenyan-full", "wenyan-ultra")
 CAVEMAN_DEFAULT_LEVEL = "full"
 HTTP_TIMEOUT = 15.0
@@ -351,6 +357,10 @@ def _keychain_remove(provider: str) -> None:
 # --- env-var contract -------------------------------------------------------
 
 ENV_VAR_MAP: dict[tuple[str, str], str] = {
+    ("claude", "enabled"): "ANVIL_CLAUDE_ENABLED",
+    ("openai", "enabled"): "ANVIL_OPENAI_ENABLED",
+    ("gemini", "enabled"): "ANVIL_GEMINI_ENABLED",
+    ("ollama", "enabled"): "ANVIL_OLLAMA_ENABLED",
     ("openai", "api_key"): "ANVIL_OPENAI_API_KEY",
     ("openai", "endpoint"): "ANVIL_OPENAI_ENDPOINT",
     ("openai", "model"): "ANVIL_OPENAI_MODEL",
@@ -384,6 +394,50 @@ def resolve_value(provider: str, key: str, env_var: str | None, default: str) ->
             else:
                 return raw
     return default
+
+
+# --- reviewer enable/disable --------------------------------------------------
+
+# Accepted spellings of the enabled flag. Defined here only: anvil-review.py asks
+# `anvil-config.py get PROVIDER enabled` rather than parsing these itself.
+_TRUE_TOKENS = frozenset({"true", "1", "yes", "on"})
+_FALSE_TOKENS = frozenset({"false", "0", "no", "off"})
+
+
+def resolve_enabled(provider: str, block: dict[str, Any] | None, default: bool = False) -> bool:
+    """Resolve a reviewer's on/off state: ANVIL_<PROVIDER>_ENABLED env wins over config.
+
+    This is the ONE resolver for the enabled flag. `get PROVIDER enabled` routes
+    through it (see cmd_get), so anvil-review.py's reviewer gate and the roster
+    commands can never disagree about what a given env value means.
+
+    Mirrors resolve_value()'s env-wins contract. An unrecognized env value is ignored
+    (with a stderr warning) rather than silently flipping a reviewer off. `default`
+    applies only when there is no config block at all (legacy env-only setups with
+    no config.json), where the historical behaviour is "enabled".
+    """
+    env_var = ENV_VAR_MAP.get((provider, "enabled"))
+    raw = os.environ.get(env_var, "").strip().lower() if env_var else ""
+    if raw:
+        if raw in _TRUE_TOKENS:
+            return True
+        if raw in _FALSE_TOKENS:
+            return False
+        print(
+            f"anvil-config: {env_var}={raw!r} is not a boolean "
+            f"(expected one of {', '.join(sorted(_TRUE_TOKENS | _FALSE_TOKENS))}); "
+            f"falling back to config.json",
+            file=sys.stderr,
+        )
+    if block is None:
+        return default
+    return bool(block.get("enabled", default))
+
+
+def enabled_reviewers(merged: dict[str, Any]) -> set[str]:
+    """Names of reviewers that are on, honouring the ANVIL_<PROVIDER>_ENABLED overrides."""
+    return {name for name, block in merged.get("reviewers", {}).items()
+            if resolve_enabled(name, block)}
 
 
 # --- caveman output mode -----------------------------------------------------
@@ -547,7 +601,7 @@ def cmd_status(_args: argparse.Namespace) -> int:
         print("needs-setup")
         return 0
     merged = merge_with_defaults(cfg)
-    enabled = [k for k, v in merged["reviewers"].items() if v.get("enabled")]
+    enabled = enabled_reviewers(merged)
     if merged.get("setup_completed") and enabled:
         print("configured")
     else:
@@ -570,6 +624,16 @@ def cmd_read(_args: argparse.Namespace) -> int:
 
 
 def cmd_get(args: argparse.Namespace) -> int:
+    if args.key == "enabled":
+        # The on/off flag has its own validated resolver; route through it so callers
+        # (notably anvil-review.py's reviewer gate) get a canonical "true"/"false"
+        # and the same env warnings the roster commands emit. --default applies only
+        # when no config.json exists, preserving the legacy env-only flow.
+        cfg = load_config()
+        block = merge_with_defaults(cfg)["reviewers"].get(args.provider) if cfg else None
+        default_on = (args.default or "true").strip().lower() not in _FALSE_TOKENS
+        print("true" if resolve_enabled(args.provider, block, default=default_on) else "false")
+        return 0
     val = resolve_value(args.provider, args.key, args.env_var, args.default or "")
     print(val)
     return 0
@@ -605,9 +669,11 @@ def cmd_roster(args: argparse.Namespace) -> int:
         merged = default_config()
     else:
         merged = merge_with_defaults(cfg)
-    enabled = {k for k, v in merged["reviewers"].items() if v.get("enabled")}
+    enabled = enabled_reviewers(merged)
     roster = merged["roster"].get(args.kind, [])
-    out = [r for r in roster if r in enabled] or list(enabled)
+    # Fallback order is pinned: a set has no order, so `list(enabled)` would hand
+    # /anvil a different reviewer from run to run when the roster is empty.
+    out = [r for r in roster if r in enabled] or [r for r in ROSTER_PRIORITY if r in enabled]
     if args.kind == "medium":
         print(out[0] if out else "")
     else:
@@ -660,6 +726,60 @@ def cmd_set(args: argparse.Namespace) -> int:
     else:
         print("ok")
     return 0
+
+
+def _set_reviewer_enabled(provider: str, enabled: bool) -> int:
+    """Flip a reviewer on/off and sync roster membership. Credentials are never touched.
+
+    Disabling drops the provider from both rosters; enabling appends it if absent.
+    api_key / endpoint / model / host are left exactly as they are, so a disabled
+    reviewer can be re-enabled later without re-entering anything.
+    """
+    if provider not in PROVIDERS:
+        print(f"anvil-config: unknown provider '{provider}'", file=sys.stderr)
+        return 2
+    cfg = merge_with_defaults(load_config() or default_config())
+    cfg["reviewers"].setdefault(provider, {})["enabled"] = enabled
+    for kind in ("medium", "large"):
+        entries = [r for r in cfg["roster"].get(kind, []) if isinstance(r, str)]
+        if enabled:
+            if provider not in entries:
+                entries.append(provider)
+        else:
+            entries = [r for r in entries if r != provider]
+        cfg["roster"][kind] = entries
+    atomic_write(config_path(), json.dumps(cfg, indent=2) + "\n")
+
+    env_var = ENV_VAR_MAP.get((provider, "enabled"), "")
+    env_raw = os.environ.get(env_var, "").strip().lower() if env_var else ""
+    if env_raw in _TRUE_TOKENS | _FALSE_TOKENS:
+        # Only a *recognized* token of the opposite polarity actually overrides the
+        # write. Unrecognized values are ignored by resolve_enabled(), so warning
+        # about them would contradict what really happens.
+        if (env_raw in _TRUE_TOKENS) != enabled:
+            print(f"anvil-config: warning — {env_var}={env_raw!r} is set and overrides "
+                  f"config.json; unset it for this change to take effect", file=sys.stderr)
+    elif env_raw:
+        print(f"anvil-config: note — {env_var}={env_raw!r} is not a boolean and is "
+              f"ignored; config.json is authoritative", file=sys.stderr)
+
+    still_on = sorted(enabled_reviewers(cfg))
+    if not still_on:
+        print("anvil-config: warning — no reviewers are enabled; /anvil will have "
+              "nothing to review with. Run /anvil-setup or enable one.", file=sys.stderr)
+    print(f"ok ({provider} {'enabled' if enabled else 'disabled'}; credentials untouched)")
+    print(f"  enabled reviewers: {', '.join(still_on) or '(none)'}")
+    print(f"  roster.medium:     {','.join(cfg['roster'].get('medium', [])) or '(empty)'}")
+    print(f"  roster.large:      {','.join(cfg['roster'].get('large', [])) or '(empty)'}")
+    return 0
+
+
+def cmd_enable(args: argparse.Namespace) -> int:
+    return _set_reviewer_enabled(args.provider, True)
+
+
+def cmd_disable(args: argparse.Namespace) -> int:
+    return _set_reviewer_enabled(args.provider, False)
 
 
 def cmd_prompt_key(args: argparse.Namespace) -> int:
@@ -912,7 +1032,7 @@ def cmd_summary(_args: argparse.Namespace) -> int:
     print(f"setup_completed:  {merged.get('setup_completed') or '(not set)'}")
     print(f"key_storage:      {backend or 'plaintext (no keychain available)'}")
     for name, block in merged["reviewers"].items():
-        flag = "ENABLED " if block.get("enabled") else "disabled"
+        flag = "ENABLED " if resolve_enabled(name, block) else "disabled"
         bits = []
         for k, v in block.items():
             if k == "enabled":
@@ -1150,6 +1270,16 @@ def build_parser() -> argparse.ArgumentParser:
     s.add_argument("provider", choices=PROVIDERS)
     s.add_argument("assignments", nargs="+")
     s.set_defaults(func=cmd_set)
+
+    en = sub.add_parser("enable", help="turn a reviewer on and add it to the rosters")
+    en.add_argument("provider", choices=PROVIDERS)
+    en.set_defaults(func=cmd_enable)
+
+    dis = sub.add_parser("disable",
+                         help="turn a reviewer off and drop it from the rosters "
+                              "(api_key/endpoint/model are kept)")
+    dis.add_argument("provider", choices=PROVIDERS)
+    dis.set_defaults(func=cmd_disable)
 
     v = sub.add_parser("validate")
     v.add_argument("provider", choices=sorted(VALIDATORS))

@@ -48,13 +48,13 @@ plugin/
 
 ## Key design invariants
 
-**anvil-config.py is the single owner of config.json.** Never write to it directly. Use the `save`, `set`, `set-caveman`, or `gui-key` subcommands. The schema carries a top-level `caveman` block (`{"enabled": false, "level": "full"}`) alongside `reviewers` and `roster`; `set-caveman LEVEL|off` is the only writer for it and `caveman` resolves the active level (env → config → `off`). The `caveman` skill itself is an optional external dependency (not bundled with claude-anvil, lives at `~/.claude/skills/caveman/`); when it's absent `/anvil` degrades to normal prose regardless of the configured level.
+**anvil-config.py is the single owner of config.json.** Never write to it directly. Use the `save`, `set`, `enable`, `disable`, `set-caveman`, or `gui-key` subcommands. `enable`/`disable PROVIDER` flip `reviewers.<name>.enabled` and sync roster membership without touching `api_key`/`endpoint`/`model` — that is the supported way to turn a reviewer off without re-running the setup wizard or re-entering credentials. The schema carries a top-level `caveman` block (`{"enabled": false, "level": "full"}`) alongside `reviewers` and `roster`; `set-caveman LEVEL|off` is the only writer for it and `caveman` resolves the active level (env → config → `off`). The `caveman` skill itself is an optional external dependency (not bundled with claude-anvil, lives at `~/.claude/skills/caveman/`); when it's absent `/anvil` degrades to normal prose regardless of the configured level.
 
 **anvil-ledger.py is the single owner of the SQLite DB.** Never shell out to raw `sqlite3`. All SQL goes through the ledger CLI.
 
 **API keys never appear in argv, shell args, or tool results.** On Windows they are DPAPI-encrypted and stored in config.json with a `dpapi:` prefix. On macOS/Linux they go to the OS keychain. `gui-key` collects them via a Tkinter password dialog.
 
-**Env vars win over config.json.** The full env var list is in `.env.example`. This is enforced in `anvil-config.py resolve_value()` (and `resolve_caveman()` for `ANVIL_CAVEMAN_LEVEL`, which overrides the config `caveman` block; valid levels are `lite/full/ultra/wenyan-lite/wenyan-full/wenyan-ultra`, and `off/none/disabled/empty` disables it).
+**Env vars win over config.json.** The full env var list is in `.env.example`. This is enforced in `anvil-config.py resolve_value()` — except the per-provider `enabled` flag, which has its own validated resolver `resolve_enabled()` (`ANVIL_<PROVIDER>_ENABLED`, `true/1/yes/on` vs `false/0/no/off`, non-boolean values warn and fall back to config). `get PROVIDER enabled` routes through it and `anvil-review.py` asks via that subcommand rather than parsing the env var itself — keep it that way, or the reviewer gate and the roster commands will drift apart. Env precedence is also enforced in `resolve_caveman()` (for `ANVIL_CAVEMAN_LEVEL`, which overrides the config `caveman` block; valid levels are `lite/full/ultra/wenyan-lite/wenyan-full/wenyan-ultra`, and `off/none/disabled/empty` disables it).
 
 **`hooks/hooks.json` wires two hooks:**
 - `PreToolUse Bash` → `anvil-gate-commit.py` — blocks commits not issued by /anvil
@@ -72,6 +72,8 @@ All three `anvil-review.py` providers return the same JSON schema:
 ```json
 {"verdict": "pass|concern|fail", "summary": "...", "findings": [...]}
 ```
+
+**Reviewer HTTP calls are bounded by two true wall-clock deadlines** — `ANVIL_REVIEW_HTTP_TIMEOUT` per attempt (default 180s) and `ANVIL_REVIEW_TOTAL_TIMEOUT` per call including retries and backoff (default 420s). `urlopen(timeout=…)` alone is per-socket-operation, not a total deadline, so `http_post_json` runs each request on a daemon thread and joins with a deadline. Use `threading.Thread(daemon=True)`, never `ThreadPoolExecutor` — its atexit handler joins workers and would hang the process on the very stuck socket this guards against.
 
 ## Useful script invocations
 
@@ -99,6 +101,10 @@ python plugin/scripts/anvil-ledger.py memory-list
 
 # Validate a reviewer's credentials are reachable
 python plugin/scripts/anvil-config.py validate gemini
+
+# Turn a reviewer off / back on without touching its API key or endpoint
+python plugin/scripts/anvil-config.py disable openai
+python plugin/scripts/anvil-config.py enable openai
 ```
 
 ## Changing the Claude reviewer model
