@@ -61,15 +61,29 @@ def test_extract_json_returns_none_when_nothing_parses(anvil_review, text):
     assert anvil_review.extract_json(text) is None
 
 
-def test_extract_json_brace_scanner_is_string_unaware(anvil_review):
-    """Known weakness (anvil-review.py:189-206): the balanced-brace fallback
-    counts braces inside string values, so a `}` in a string defeats it once the
-    direct json.loads path is unavailable (here: because of the wrapping prose)."""
+def test_extract_json_brace_scanner_ignores_braces_inside_strings(anvil_review):
+    """The balanced-brace fallback is string-aware. Reviewer findings routinely
+    contain braces in their prose, which used to close the object early and lose
+    the whole verdict once the direct json.loads path was unavailable."""
     text = 'Review: {"what": "closes with } here", "verdict": "pass"} done'
-    assert anvil_review.extract_json(text) is None
-    # ...whereas the very same object parses fine without the prose.
+    assert anvil_review.extract_json(text)["verdict"] == "pass"
+    # ...and the same object still parses without the wrapping prose.
     assert anvil_review.extract_json(
         '{"what": "closes with } here", "verdict": "pass"}')["verdict"] == "pass"
+
+
+def test_extract_json_brace_scanner_handles_an_escaped_quote_in_a_string(anvil_review):
+    text = r'Review: {"what": "he said \"} done\" loudly", "verdict": "concern"} end'
+    assert anvil_review.extract_json(text)["verdict"] == "concern"
+
+
+def test_extract_json_brace_scanner_handles_an_opening_brace_inside_a_string(anvil_review):
+    text = 'Review: {"fix": "wrap it in ${VALUE}", "verdict": "fail"} end'
+    assert anvil_review.extract_json(text)["verdict"] == "fail"
+
+
+def test_extract_json_ignores_a_stray_closing_brace_before_the_object(anvil_review):
+    assert anvil_review.extract_json('oops } stray {"verdict": "pass"}') == {"verdict": "pass"}
 
 
 def test_extract_json_skips_an_unparseable_first_object(anvil_review):

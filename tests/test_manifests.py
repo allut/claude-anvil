@@ -75,6 +75,23 @@ def test_hook_matchers_and_command_paths():
     assert any("anvil-track-edit.py" in c for c in commands)
 
 
+def test_hook_commands_never_execute_python3_to_probe_for_it():
+    """On Windows `python3` is commonly a 0-byte Microsoft Store alias that opens
+    the Store. The hooks must resolve it by inspecting the path (`command -v` +
+    `[ -s ]`), never by running it."""
+    hooks = _json(PLUGIN / "hooks" / "hooks.json")["hooks"]
+    commands = [entry["command"]
+                for group in hooks.values()
+                for h in group
+                for entry in h["hooks"]]
+    for command in commands:
+        assert "command -v python3" in command
+        assert "-s " in command, "the 0-byte Store alias must be rejected by size"
+        assert not re.search(r"python3\s+-c", command), \
+            f"hook probes by executing python3: {command!r}"
+        assert "$ANVIL_PYTHON" in command
+
+
 # --- plugin.json / marketplace.json -------------------------------------------
 
 def test_plugin_manifest_paths_exist():

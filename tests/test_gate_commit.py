@@ -5,6 +5,8 @@ The gate never writes stdout and never emits JSON.
 """
 from __future__ import annotations
 
+import shlex
+
 import pytest
 
 from helpers import hook_payload, run_cli, seed_db
@@ -45,25 +47,188 @@ def commit_payload(command="git commit -m x"):
         ("git committed", False),         # \b after "commit"
         ("", False),
         ("git status", False),
-        # Bug probe -- BENIGN_FLAGS_RE (anvil-gate-commit.py:29) is
-        #   \b(--help|-h|--dry-run)\b
-        # and the LEADING \b can never match: a word boundary before "-" needs a
-        # word character to its left, but a flag is always preceded by a space.
-        # So the benign-flag escape hatch is dead code and `git commit --dry-run`
-        # is gated like a real commit. Pinned as current behavior; see follow-ups.
-        ("git commit --dry-run", True),
-        ("git commit --help", True),
-        ("git commit -h", True),
-        # ...it does fire when a word character precedes the flag, which is the
-        # only shape the leading \b admits.
-        ("git commit x-h", False),
-        # Documented over-trigger: the regex is not shell-aware, so a `git commit`
-        # inside a quoted string still trips the gate. Pinned so any future regex
-        # change has to be a deliberate decision.
-        ("echo 'git commit' && ls", True),
+        # Benign flags are whole-token matches, so these are genuinely waved
+        # through (the old \b-anchored regex could never fire on them).
+        ("git commit --dry-run", False),
+        ("git commit --help", False),
+        ("git commit -h", False),
+        # ...but only as a whole token. "x-h" is not the -h flag.
+        ("git commit x-h", True),
+        # Shell-aware: a `git commit` inside a quoted string is a string, not a
+        # commit, so it no longer trips the gate.
+        ("echo 'git commit' && ls", False),
+        ("git status && echo 'git commit'", False),
+        # A real commit later in the same line is still caught.
+        ("echo hi && git commit -m x", True),
+        # git's own global options do not hide the subcommand.
+        ("git -c user.name=x commit -m y", True),
+        ("git -C /repo commit", True),
+        ("git --no-pager commit", True),
+        ("git -C /repo status", False),
+        # Deliberate over-block: the rule does not prove that `commit` is the
+        # subcommand rather than an option value. See _segment_is_gated_commit.
+        ("git -C commit status", True),
+        # An explicit interpreter path is still git.
+        ("/usr/bin/git commit -m x", True),
+        ("git.exe commit -m x", True),
     ],
 )
 def test_is_gated_git_commit(anvil_gate, command, expected):
+    assert anvil_gate.is_gated_git_commit(command) is expected
+
+
+@pytest.mark.parametrize("command", [
+    'git commit -m "note about --dry-run"',
+    "git commit -m 'ship it --help'",
+    'git commit -m "x" --author="a -h b"',
+])
+def test_benign_flags_cannot_be_spoofed_from_inside_a_quoted_argument(anvil_gate, command):
+    """Regression guard. A substring match on the raw command line would read
+    the flag inside the commit message and wave a real commit through the gate.
+    shlex keeps the message as one token, so the flag is never seen."""
+    assert anvil_gate.is_gated_git_commit(command) is True
+
+
+@pytest.mark.parametrize("command", [
+    "curl -h && git commit -m x",
+    "terraform apply --dry-run && git commit -m x",
+    "git status --help; git commit -m x",
+    "git commit -m x | tee -h",
+    "sudo -h git commit -m x",
+])
+def test_a_benign_flag_on_another_command_does_not_excuse_the_commit(anvil_gate, command):
+    """Regression guard (reviewer finding, high). The benign-flag check is scoped
+    to the segment that owns the `git` token; a `-h`/`--dry-run` belonging to any
+    other command on the line must not wave a real commit through."""
+    assert anvil_gate.is_gated_git_commit(command) is True
+
+
+@pytest.mark.parametrize("command,expected", [
+    ("git commit --dry-run && ls -h", False),
+    ("ls -l && git commit --help", False),
+    ("git commit --dry-run && git commit -m x", True),
+])
+def test_benign_flags_still_apply_within_their_own_command(anvil_gate, command, expected):
+    assert anvil_gate.is_gated_git_commit(command) is expected
+
+
+@pytest.mark.parametrize("command", [
+    "git commit&&ls",
+    "git commit;ls",
+    "git commit|cat",
+    "ls&&git commit -m x",
+    "(git commit -m x)",
+    "git commit>out.txt",
+    "ls -h&&git commit -m x",
+])
+def test_operators_without_surrounding_whitespace_still_split_commands(anvil_gate, command):
+    """Regression guard (reviewer finding, high). shlex.split only isolates an
+    operator when spaces surround it, so `git commit&&ls` tokenized to
+    ["git", "commit&&ls"] and evaded the gate entirely. _tokenize uses
+    punctuation_chars=True so spacing cannot hide an operator."""
+    assert anvil_gate.is_gated_git_commit(command) is True
+
+
+@pytest.mark.parametrize("command", [
+    "git > /dev/null commit -m x",
+    "git 1>/tmp/x commit -m x",
+    "git < /dev/null commit -m x",
+    "git 2>&1 commit -m x",
+    "git &> /dev/null commit -m x",
+    "git commit -m x > out",
+    "git commit>out.txt",
+])
+def test_redirections_do_not_hide_the_subcommand(anvil_gate, command):
+    """Regression guard (reviewer finding, high). bash allows a redirection
+    anywhere inside a simple command, so `git > /dev/null commit -m x` is a real
+    commit. Treating the redirection as a command separator put `git` in one
+    segment and `commit` in the next, and the whole line went ungated."""
+    assert anvil_gate.is_gated_git_commit(command) is True
+
+
+@pytest.mark.parametrize("command", [
+    "git -c 1 > commit.log commit -m x",
+    "git -C 2 > out commit -m x",
+    "git --git-dir 1 > out commit -m x",
+    "git -c 1 >> out commit -m x",
+    "git -c 2 2>&1 commit -m x",
+])
+def test_an_option_value_that_looks_like_an_fd_does_not_hide_the_commit(anvil_gate, command):
+    """Regression guard (reviewer finding, high). A bare digit before a
+    redirection is ambiguous once the tokenizer drops whitespace -- it may be an
+    fd prefix or the value of -c/-C. The blunt rule never has to decide."""
+    assert anvil_gate.is_gated_git_commit(command) is True
+
+
+@pytest.mark.parametrize("command,expected", [
+    # Documented over-blocks: `commit` appears as an argument or a filename, and
+    # the rule does not try to tell that apart from a real subcommand.
+    ("git status > commit", True),
+    ("git log --grep commit", True),
+    ("git log --oneline", False),
+    ("git status", False),
+    ("git diff --staged", False),
+    # No git executable at all -> never gated, whatever the words are.
+    ("echo git > commit", True),
+    ("echo commit", False),
+    ("npm run commit", False),
+])
+def test_the_blunt_rule_over_blocks_rather_than_under_blocks(anvil_gate, command, expected):
+    """Pins the deliberate imprecision. Every case here that returns True is a
+    false block, accepted so that no real commit can slip through; the False
+    cases confirm ordinary git usage is untouched."""
+    assert anvil_gate.is_gated_git_commit(command) is expected
+
+
+@pytest.mark.parametrize("command", [
+    'eval "git commit -m x"',
+    "eval 'git commit -m x'",
+])
+def test_eval_arguments_are_rescanned(anvil_gate, command):
+    assert anvil_gate.is_gated_git_commit(command) is True
+
+
+@pytest.mark.parametrize("command", [
+    'bash -c "git commit -m x"',
+    "sh -c 'git commit -m x'",
+    'bash -lc "git commit -m x"',
+    "echo $(git commit -m x)",
+    "`git commit -m x`",
+    'bash -c "bash -c \\"git commit -m x\\""',
+])
+def test_wrapped_and_substituted_commits_are_still_caught(anvil_gate, command):
+    """Regression guard (reviewer finding, high). shlex collapses `bash -c "..."`
+    into one token and glues `$(` onto the executable, so a naive token walk sees
+    no `git` at all -- a regression against the old substring regex."""
+    assert anvil_gate.is_gated_git_commit(command) is True
+
+
+@pytest.mark.parametrize("command", [
+    "echo 'bash -c \"git commit\"'",
+    "grep -r 'git commit' .",
+])
+def test_wrapper_recursion_does_not_reintroduce_the_quoted_string_false_positive(
+        anvil_gate, command):
+    """Only a real shell's -c argument is re-scanned. Quoting it into echo/grep
+    keeps it inert."""
+    assert anvil_gate.is_gated_git_commit(command) is False
+
+
+def test_wrapper_recursion_is_depth_bounded(anvil_gate):
+    """A pathological nest must terminate rather than recurse without limit."""
+    command = "git commit -m x"
+    for _ in range(anvil_gate._MAX_WRAPPER_DEPTH + 3):
+        command = "bash -c " + shlex.quote(command)
+    assert anvil_gate.is_gated_git_commit(command) in (True, False)
+
+
+@pytest.mark.parametrize("command,expected", [
+    ('git commit -m "unbalanced', True),
+    ("echo 'unbalanced && ls", False),
+])
+def test_untokenizable_commands_fall_back_to_the_regex(anvil_gate, command, expected):
+    """shlex.split raises on unbalanced quotes. The gate then falls back to
+    GIT_COMMIT_RE and stays closed rather than allowing an unparseable commit."""
     assert anvil_gate.is_gated_git_commit(command) is expected
 
 

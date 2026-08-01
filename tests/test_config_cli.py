@@ -298,19 +298,50 @@ def test_set_enabled_true_false_becomes_a_bool(cfg, raw, expected):
     assert cfg.read()["reviewers"]["ollama"]["enabled"] is expected
 
 
-def test_set_enabled_one_is_stored_as_a_string(cfg, anvil_config):
-    """Bug probe: only the literal 'true'/'false' spellings are coerced
-    (anvil-config.py:710-711). `enabled=1` lands as the *string* "1", which
-    bool() at :434 then reads as truthy -- right answer, wrong type. `enabled=0`
-    is the dangerous one: the string "0" is also truthy."""
+@pytest.mark.parametrize("raw,expected", [("1", True), ("yes", True), ("ON", True),
+                                          ("0", False), ("no", False), ("Off", False),
+                                          (" 0 ", False)])
+def test_set_enabled_accepts_the_whole_boolean_vocabulary(cfg, raw, expected):
+    """cmd_set shares _TRUE_TOKENS/_FALSE_TOKENS with resolve_enabled, so every
+    spelling the env var accepts is stored as a real JSON bool. Storing the raw
+    string would be silently wrong: "0" is truthy in Python."""
     cfg.write(configured())
-    cfg.run("set", "ollama", "enabled=1")
-    assert cfg.read()["reviewers"]["ollama"]["enabled"] == "1"
-    assert cfg.run("get", "ollama", "enabled") == 0
+    assert cfg.run("set", "ollama", f"enabled={raw}") == 0
+    assert cfg.read()["reviewers"]["ollama"]["enabled"] is expected
 
-    cfg.run("set", "ollama", "enabled=0")
-    assert cfg.read()["reviewers"]["ollama"]["enabled"] == "0"
-    assert anvil_config.resolve_enabled("ollama", {"enabled": "0"}) is True
+
+def test_set_enabled_zero_actually_disables_the_reviewer(cfg, capsys):
+    """The bug this replaces: `set openai enabled=0` wrote the string "0", which
+    resolved as enabled, so /anvil kept calling a reviewer the user turned off."""
+    cfg.write(configured())
+    cfg.run("set", "openai", "enabled=0")
+    assert cfg.read()["reviewers"]["openai"]["enabled"] is False
+    capsys.readouterr()
+    cfg.run("get", "openai", "enabled")
+    assert capsys.readouterr().out.strip() == "false"
+    cfg.run("roster", "large")
+    assert "openai" not in capsys.readouterr().out
+
+
+def test_set_enabled_rejects_a_non_boolean(cfg, capsys):
+    cfg.write(configured())
+    before = cfg.read()["reviewers"]["ollama"]["enabled"]
+    assert cfg.run("set", "ollama", "enabled=maybe") == 2
+    assert "is not a boolean" in capsys.readouterr().err
+    assert cfg.read()["reviewers"]["ollama"]["enabled"] is before
+
+
+@pytest.mark.parametrize("stored,expected", [("0", False), ("off", False),
+                                             ("1", True), ("true", True)])
+def test_resolve_enabled_coerces_a_string_left_in_config_json(anvil_config, stored, expected):
+    """Hand-edited config.json (or one written before the cmd_set fix) can hold a
+    string. bool() would call every non-empty one truthy."""
+    assert anvil_config.resolve_enabled("ollama", {"enabled": stored}) is expected
+
+
+def test_resolve_enabled_warns_and_uses_the_default_for_a_junk_string(anvil_config, capsys):
+    assert anvil_config.resolve_enabled("ollama", {"enabled": "banana"}) is False
+    assert "is not a boolean" in capsys.readouterr().err
 
 
 def test_set_api_key_goes_through_the_keychain(cfg, monkeypatch, capsys):

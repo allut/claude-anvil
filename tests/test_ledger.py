@@ -50,16 +50,29 @@ def test_init_is_idempotent(tmp_path):
 
 
 def test_foreign_keys_are_enforced(tmp_path):
-    """PRAGMA foreign_keys=ON (connect(), :54) makes an orphan session_files row fail.
+    """PRAGMA foreign_keys=ON (connect()) makes an orphan session_files row fail.
 
-    It also demonstrates the recorded gap: a DB error surfaces as an uncaught
-    traceback, not a clean non-zero return from main()."""
+    main() reports it as a clean exit 1 with a one-line message; the traceback
+    that used to leak out of argparse dispatch is gone."""
     db = tmp_path / "a.db"
     ok(ledger(db, "init"))
     r = ledger(db, "track-edit", "999", "x.py", "Edit")
-    assert r.returncode != 0
-    assert "IntegrityError" in r.stderr
-    assert "Traceback" in r.stderr
+    assert r.returncode == 1
+    assert "anvil-ledger: sqlite error" in r.stderr
+    assert "FOREIGN KEY constraint failed" in r.stderr
+    assert "Traceback" not in r.stderr
+    assert r.stdout == ""
+
+
+def test_an_unreadable_db_path_is_reported_without_a_traceback(tmp_path):
+    """A directory where the DB file should be is an OSError/sqlite3 failure.
+    Either way the CLI exits 1 with a message rather than a traceback."""
+    db = tmp_path / "a.db"
+    db.mkdir()
+    r = ledger(db, "init")
+    assert r.returncode == 1
+    assert "anvil-ledger:" in r.stderr
+    assert "Traceback" not in r.stderr
 
 
 # --- insert-check -------------------------------------------------------------

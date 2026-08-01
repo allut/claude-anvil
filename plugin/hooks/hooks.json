@@ -6,7 +6,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "python3 \"${CLAUDE_PLUGIN_ROOT}/scripts/anvil-gate-commit.py\""
+            "command": "PY=\"$ANVIL_PYTHON\"; [ -n \"$PY\" ] || { P3=$(command -v python3 2>/dev/null); if [ -n \"$P3\" ] && [ -s \"$P3\" ]; then PY=python3; else PY=python; fi; }; \"$PY\" \"${CLAUDE_PLUGIN_ROOT}/scripts/anvil-gate-commit.py\""
           }
         ]
       }
@@ -17,7 +17,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "python3 \"${CLAUDE_PLUGIN_ROOT}/scripts/anvil-track-edit.py\""
+            "command": "PY=\"$ANVIL_PYTHON\"; [ -n \"$PY\" ] || { P3=$(command -v python3 2>/dev/null); if [ -n \"$P3\" ] && [ -s \"$P3\" ]; then PY=python3; else PY=python; fi; }; \"$PY\" \"${CLAUDE_PLUGIN_ROOT}/scripts/anvil-track-edit.py\""
           }
         ]
       }

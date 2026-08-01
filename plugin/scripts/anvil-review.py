@@ -185,13 +185,32 @@ def extract_json(text: str) -> dict | None:
         return json.loads(_fix_escapes(stripped))
     except json.JSONDecodeError:
         pass
-    # Fall back: first balanced {...} substring.
+    # Fall back: first balanced {...} substring. Brace counting is string-aware,
+    # because reviewer findings routinely contain braces inside their text
+    # ("wrap it in ${...}"), and a naive counter closes the object early there.
+    # String tracking starts only once we are inside an object, so unbalanced
+    # quotes in the surrounding prose cannot corrupt the scan.
     depth = 0
     start = -1
+    in_string = False
+    escaped = False
     for i, ch in enumerate(stripped):
-        if ch == "{":
-            if depth == 0:
+        if depth == 0:
+            if ch == "{":
                 start = i
+                depth = 1
+            continue
+        if in_string:
+            if escaped:
+                escaped = False
+            elif ch == "\\":
+                escaped = True
+            elif ch == '"':
+                in_string = False
+            continue
+        if ch == '"':
+            in_string = True
+        elif ch == "{":
             depth += 1
         elif ch == "}":
             depth -= 1

@@ -54,11 +54,59 @@ plugin/
 
 **API keys never appear in argv, shell args, or tool results.** On Windows they are DPAPI-encrypted and stored in config.json with a `dpapi:` prefix. On macOS/Linux they go to the OS keychain. `gui-key` collects them via a Tkinter password dialog.
 
-**Env vars win over config.json.** The full env var list is in `.env.example`. This is enforced in `anvil-config.py resolve_value()` — except the per-provider `enabled` flag, which has its own validated resolver `resolve_enabled()` (`ANVIL_<PROVIDER>_ENABLED`, `true/1/yes/on` vs `false/0/no/off`, non-boolean values warn and fall back to config). `get PROVIDER enabled` routes through it and `anvil-review.py` asks via that subcommand rather than parsing the env var itself — keep it that way, or the reviewer gate and the roster commands will drift apart. Env precedence is also enforced in `resolve_caveman()` (for `ANVIL_CAVEMAN_LEVEL`, which overrides the config `caveman` block; valid levels are `lite/full/ultra/wenyan-lite/wenyan-full/wenyan-ultra`, and `off/none/disabled/empty` disables it).
+**Env vars win over config.json.** The full env var list is in `.env.example`. This is enforced in `anvil-config.py resolve_value()` — except the per-provider `enabled` flag, which has its own validated resolver `resolve_enabled()` (`ANVIL_<PROVIDER>_ENABLED`, `true/1/yes/on` vs `false/0/no/off`, non-boolean values warn and fall back to config). `get PROVIDER enabled` routes through it and `anvil-review.py` asks via that subcommand rather than parsing the env var itself — keep it that way, or the reviewer gate and the roster commands will drift apart. `_TRUE_TOKENS`/`_FALSE_TOKENS` are the single vocabulary for *every* reader and writer of that flag: `resolve_enabled()` uses them for both the env var and a string left in config.json (never `bool()`, which calls `"0"` truthy), and `set PROVIDER enabled=…` uses them to store a real JSON bool, exiting 2 on anything else. Env precedence is also enforced in `resolve_caveman()` (for `ANVIL_CAVEMAN_LEVEL`, which overrides the config `caveman` block; valid levels are `lite/full/ultra/wenyan-lite/wenyan-full/wenyan-ultra`, and `off/none/disabled/empty` disables it).
 
 **`hooks/hooks.json` wires two hooks:**
 - `PreToolUse Bash` → `anvil-gate-commit.py` — blocks commits not issued by /anvil
 - `PostToolUse Edit|Write|MultiEdit` → `anvil-track-edit.py` — feeds session file tracking
+
+Neither hook may hardcode `python3`: on a stock python.org Windows install `python3`
+is a Microsoft Store alias that opens the Store instead of running the script. Both
+commands resolve the interpreter as `$ANVIL_PYTHON`, else `python3` when
+`command -v python3` resolves to a **non-empty** file (`[ -s ]` — the Store alias is a
+0-byte reparse point), else `python`. Never probe by *running* `python3`: on the
+affected machines that is the failure mode, not the test for it. Keep the script
+invocation as a single `exec`-shaped call so the hook's exit code (2 = block)
+propagates unchanged.
+
+**`anvil-gate-commit.py` tokenizes with `shlex`, never with substring regexes.** Both
+the `git … commit` detection and the benign-flag escape hatch (`--help`, `-h`,
+`--dry-run`) match whole shell tokens. A regex over the raw command line is wrong in
+both directions: it fires on `echo 'git commit'`, and — worse — it would let
+`git commit -m "note about --dry-run"` past the gate. `GIT_COMMIT_RE` survives only as
+the fail-closed fallback for command lines `shlex.split` cannot parse.
+
+**The detector is deliberately blunt, and must stay that way.** A segment is gated
+when it contains a git executable and a bare `commit` token, with no benign flag from
+the git token onward. It does not attempt to prove that `commit` is the subcommand
+rather than an option value, a redirection target or an argument.
+
+That imprecision is the design, not a shortcut. An earlier version modelled bash's
+grammar properly — a global-option walk with `_GIT_OPTS_WITH_VALUE`, redirection
+stripping, fd-prefix disambiguation. Four consecutive adversarial review rounds each
+found a *different* bypass in it (`git -c x commit`, `git > f commit`,
+`git -c 1 > f commit`, …), every one discovered after the change had passed the full
+test suite, and every one under-blocking: a real commit went ungated. Precision here
+has a bad track record; do not reintroduce it without a much stronger reason than
+"the current rule over-blocks".
+
+Three properties remain load-bearing and have named tests:
+- **Per-command scoping.** The line is split on shell operators and each candidate is
+  judged only by its own segment's flags, from the `git` token onward. Scanning the
+  whole line lets `curl -h && git commit -m x` through.
+- **Wrapper recursion.** `bash -c "git commit"` / `eval "git commit"` leave the whole
+  command as one token; `_scan` recurses, bounded by `_MAX_WRAPPER_DEPTH`.
+- **Operator isolation.** `_tokenize` builds `shlex.shlex(..., punctuation_chars=True)`
+  rather than calling `shlex.split`. `split` only isolates an operator when whitespace
+  surrounds it, so `git commit&&ls` came back as `["git", "commit&&ls"]` and evaded the
+  gate completely. Never swap `_tokenize` back for `shlex.split`.
+
+Accepted over-blocks (pinned by tests): `git status > commit`, `git log --grep commit`,
+`git -C commit status`. Accepted under-blocks: user-defined git aliases (`git ci`) and
+shell functions — detecting those means running `git config` from inside a PreToolUse
+hook on every Bash call. The gate is an evidence-discipline aid, not a security
+boundary; it is fail-open by design (see the module docstring).
+
 
 ## Reviewer architecture
 

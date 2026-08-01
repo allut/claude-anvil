@@ -332,8 +332,17 @@ def build_parser() -> argparse.ArgumentParser:
 def main(argv: list[str] | None = None) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
-    args.func(args)
-    return 0
+    try:
+        rc = args.func(args)
+    except sqlite3.Error as e:
+        # A locked, corrupt or unreachable DB is an operational failure, not a
+        # crash to show the user as a traceback.
+        print(f"anvil-ledger: sqlite error: {e}", file=sys.stderr)
+        return 1
+    except OSError as e:
+        print(f"anvil-ledger: {e}", file=sys.stderr)
+        return 1
+    return rc if isinstance(rc, int) else 0
 
 
 if __name__ == "__main__":

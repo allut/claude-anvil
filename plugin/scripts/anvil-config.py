@@ -431,7 +431,25 @@ def resolve_enabled(provider: str, block: dict[str, Any] | None, default: bool =
         )
     if block is None:
         return default
-    return bool(block.get("enabled", default))
+    stored = block.get("enabled", default)
+    if isinstance(stored, str):
+        # A hand-edited config.json (or any writer that predates the coercion in
+        # cmd_set) can hold "0"/"off" as a string. bool() calls every non-empty
+        # string truthy, so route it through the same vocabulary as the env var.
+        lowered = stored.strip().lower()
+        if lowered in _TRUE_TOKENS:
+            return True
+        if lowered in _FALSE_TOKENS:
+            return False
+        print(
+            f"anvil-config: reviewers.{provider}.enabled={stored!r} in config.json "
+            f"is not a boolean (expected one of "
+            f"{', '.join(sorted(_TRUE_TOKENS | _FALSE_TOKENS))}); "
+            f"treating as {default}",
+            file=sys.stderr,
+        )
+        return default
+    return bool(stored)
 
 
 def enabled_reviewers(merged: dict[str, Any]) -> set[str]:
@@ -707,8 +725,21 @@ def cmd_set(args: argparse.Namespace) -> int:
             print(f"anvil-config: expected KEY=VALUE, got {assignment!r}", file=sys.stderr)
             return 2
         k, v = assignment.split("=", 1)
-        if k == "enabled" and v.lower() in ("true", "false"):
-            block[k] = v.lower() == "true"
+        if k == "enabled":
+            # Same vocabulary as ANVIL_<PROVIDER>_ENABLED. Storing the raw string
+            # would leave "0" in config.json, which reads back as enabled.
+            lowered = v.strip().lower()
+            if lowered in _TRUE_TOKENS:
+                block[k] = True
+            elif lowered in _FALSE_TOKENS:
+                block[k] = False
+            else:
+                print(
+                    f"anvil-config: enabled={v!r} is not a boolean (expected one of "
+                    f"{', '.join(sorted(_TRUE_TOKENS | _FALSE_TOKENS))})",
+                    file=sys.stderr,
+                )
+                return 2
         elif k in API_KEY_FIELDS and v:
             try:
                 config_val, label = _keychain_store(args.provider, v)

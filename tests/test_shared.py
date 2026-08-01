@@ -55,11 +55,11 @@ def test_undefined_var_is_left_verbatim(anvil_shared, monkeypatch):
     assert anvil_shared.db_path() == Path("$ANVIL_TEST_NOPE/x.db")
 
 
-def test_empty_env_value_does_not_fall_back_to_default(anvil_shared, monkeypatch):
-    """Bug probe: ANVIL_DB_PATH="" is *present*, so os.environ.get returns ""
-    instead of the default, and db_path() degrades to the CWD-relative Path(".").
-    Pinned as current behavior -- see the follow-ups list in the plan."""
-    monkeypatch.setenv("ANVIL_DB_PATH", "")
+@pytest.mark.parametrize("raw", ["", "   ", "\t\n"])
+def test_blank_env_value_falls_back_to_the_default(anvil_shared, monkeypatch, raw):
+    """A present-but-empty ANVIL_DB_PATH is treated as unset. Without this,
+    Path("") is the CWD and the ledger silently becomes project-local."""
+    monkeypatch.setenv("ANVIL_DB_PATH", raw)
     result = anvil_shared.db_path()
-    assert result == Path("")
-    assert result != Path(os.path.expanduser("~/.claude-anvil/anvil.db"))
+    assert result == Path(os.path.expanduser("~/.claude-anvil/anvil.db"))
+    assert result != Path("")
