@@ -451,3 +451,96 @@ def test_build_user_prompt_fences_the_diff(anvil_review):
 ])
 def test_openai_model_is_reasoning(anvil_review, model, expected):
     assert anvil_review._openai_model_is_reasoning(model) is expected
+
+
+# --- normalize_checks_run ------------------------------------------------------
+
+@pytest.mark.parametrize("raw", [None, "pytest", 3, {"a": 1}, True])
+def test_normalize_checks_run_non_list_becomes_empty(anvil_review, raw):
+    assert anvil_review.normalize_checks_run(raw) == []
+
+
+def test_normalize_checks_run_keeps_non_empty_strings(anvil_review):
+    assert anvil_review.normalize_checks_run(
+        ["python -m pytest", "  grep -rn foo  "]) == ["python -m pytest", "grep -rn foo"]
+
+
+def test_normalize_checks_run_drops_blank_and_structured_entries(anvil_review):
+    assert anvil_review.normalize_checks_run(
+        ["", "   ", {"cmd": "x"}, ["y"], "real"]) == ["real"]
+
+
+def test_normalize_checks_run_coerces_scalars(anvil_review):
+    assert anvil_review.normalize_checks_run([1, 2.5]) == ["1", "2.5"]
+
+
+# --- apply_provenance_guard ----------------------------------------------------
+
+def test_provenance_guard_is_inert_when_checks_were_named(anvil_review):
+    v = {"verdict": "pass", "summary": "s", "findings": []}
+    adjusted, advisory, unverified = anvil_review.apply_provenance_guard(v, ["pytest"])
+    assert adjusted["verdict"] == "pass"
+    assert advisory == []
+    assert unverified is False
+
+
+def test_provenance_guard_downgrades_an_unearned_pass(anvil_review):
+    v = {"verdict": "pass", "summary": "clean", "findings": []}
+    adjusted, advisory, unverified = anvil_review.apply_provenance_guard(v, [])
+    assert adjusted["verdict"] == "concern"
+    assert unverified is True
+    assert len(advisory) == 1
+    assert "unverified" in advisory[0]
+
+
+def test_provenance_guard_never_manufactures_a_fail_row(anvil_review):
+    """An unearned pass must land on passed=1, like every other guard adjustment."""
+    adjusted, _, _ = anvil_review.apply_provenance_guard(
+        {"verdict": "pass", "summary": "s", "findings": []}, [])
+    assert anvil_review.compute_passed(adjusted["verdict"], None) == 1
+
+
+def test_provenance_guard_leaves_an_unearned_fail_standing(anvil_review):
+    """Downgrading a fail would hide a real defect -- annotate only."""
+    v = {"verdict": "fail", "summary": "broken", "findings": [{"severity": "high"}]}
+    adjusted, advisory, unverified = anvil_review.apply_provenance_guard(v, [])
+    assert adjusted["verdict"] == "fail"
+    assert unverified is True
+    assert "empty checks_run" in advisory[0]
+
+
+def test_provenance_guard_annotates_an_unearned_concern(anvil_review):
+    v = {"verdict": "concern", "summary": "s", "findings": []}
+    adjusted, advisory, unverified = anvil_review.apply_provenance_guard(v, [])
+    assert adjusted["verdict"] == "concern"
+    assert unverified is True
+    assert advisory
+
+
+def test_provenance_guard_does_not_mutate_its_input(anvil_review):
+    v = {"verdict": "pass", "summary": "s", "findings": []}
+    anvil_review.apply_provenance_guard(v, [])
+    assert v["verdict"] == "pass"
+
+
+# --- _normalize_path line suffixes ---------------------------------------------
+
+@pytest.mark.parametrize("raw", [
+    "a/pkg/mod.py",
+    "pkg/mod.py:12",
+    "pkg/mod.py:12:5",
+    "pkg/mod.py:746-751",        # reviewers cite ranges routinely
+    "./pkg/mod.py:746-751",
+    "pkg/mod.py:12-14:3-9",
+])
+def test_normalize_path_strips_line_suffixes_including_ranges(anvil_review, raw):
+    assert anvil_review._normalize_path(raw) == "pkg/mod.py"
+
+
+def test_a_finding_citing_a_line_range_is_not_flagged_as_off_diff(anvil_review):
+    """Regression: an unstripped ':746-751' made a touched file look untouched."""
+    diff = "diff --git a/pkg/mod.py b/pkg/mod.py\n"
+    verdict = {"verdict": "concern", "summary": "s",
+               "findings": [{"severity": "low", "file": "pkg/mod.py:746-751"}]}
+    _, advisory = anvil_review.apply_coherence_guard(verdict, diff, False)
+    assert not any("does not touch" in n for n in advisory)

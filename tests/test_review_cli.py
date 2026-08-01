@@ -312,8 +312,14 @@ def test_provider_choices_match_the_providers_table(anvil_review):
     assert set(anvil_review.PROVIDERS) == {"openai", "gemini", "ollama"}
 
 
+def test_claude_is_an_ingest_provider_not_a_callable_one(anvil_review):
+    assert anvil_review._EXECUTING_PROVIDERS == {"claude"}
+    assert "claude" not in anvil_review.PROVIDERS
+
+
 @pytest.mark.parametrize("argv", [
-    ["--provider", "claude", "--task-id", "t", "--diff-file", "d"],   # claude is a Task subagent
+    ["--provider", "nope", "--task-id", "t", "--diff-file", "d"],
+    ["--provider", "claude", "--task-id", "t"],   # ingest still needs --diff-file
     ["--task-id", "t", "--diff-file", "d"],
     ["--provider", "openai", "--diff-file", "d"],
     ["--provider", "openai", "--task-id", "t"],
@@ -321,3 +327,152 @@ def test_provider_choices_match_the_providers_table(anvil_review):
 def test_invalid_argv_exits(anvil_review, argv):
     with pytest.raises(SystemExit):
         anvil_review.main(argv)
+
+
+# --- ingest mode (--provider claude) ------------------------------------------
+#
+# The Claude reviewer is spawned by the /anvil loop as a Task subagent, so its
+# verdict reaches the ledger through this path instead of through a handler.
+# Before it existed, that verdict was the one nothing guarded.
+
+def _ingest(anvil_review, tmp_path, payload, *, diff="diff --git a/x.py b/x.py\n",
+            task_id="t"):
+    """Write a subagent verdict + diff to disk, run ingest, return (rc, record)."""
+    out = tmp_path / "verdict.json"
+    out.write_text(payload if isinstance(payload, str) else json.dumps(payload),
+                   encoding="utf-8")
+    argv = ["--provider", "claude", "--task-id", task_id, "--out", str(out)]
+    if diff is None:
+        argv += ["--diff-file", str(tmp_path / "absent.patch")]
+    else:
+        diff_path = tmp_path / "d.patch"
+        diff_path.write_text(diff, encoding="utf-8")
+        argv += ["--diff-file", str(diff_path)]
+    rc = anvil_review.main(argv)
+    text = out.read_text(encoding="utf-8") if out.exists() else ""
+    try:
+        record = json.loads(text)
+    except json.JSONDecodeError:
+        record = None       # ingest refused; the file was left untouched
+    return rc, record
+
+
+def test_ingest_rewrites_the_file_with_the_ledger_record(anvil_review, tmp_path, capsys):
+    rc, rec = _ingest(anvil_review, tmp_path, {
+        "verdict": "pass", "summary": "clean", "checks_run": ["python -m pytest"],
+        "findings": [],
+    })
+    assert rc == 0
+    assert RECORD_KEYS | {"checks_run", "unverified"} <= set(rec)
+    assert rec["provider"] == "claude"
+    assert rec["verdict"] == "pass"
+    assert rec["passed"] == 1
+    assert rec["unverified"] is False
+    assert rec["advisory"] == []
+    assert "reviewer=claude verdict=pass" in capsys.readouterr().out
+
+
+def test_ingest_downgrades_a_pass_that_names_no_checks(anvil_review, tmp_path, capsys):
+    rc, rec = _ingest(anvil_review, tmp_path, {
+        "verdict": "pass", "summary": "looks fine", "findings": [],
+    })
+    assert rc == 0
+    assert rec["verdict"] == "concern"
+    assert rec["unverified"] is True
+    assert rec["passed"] == 1          # guards never manufacture a FAIL row
+    assert any("unverified" in n for n in rec["advisory"])
+    assert "unverified=1" in capsys.readouterr().out
+
+
+def test_ingest_applies_the_coherence_guard_too(anvil_review, tmp_path):
+    """A `fail` with no high-severity finding is downgraded, exactly as for HTTP providers."""
+    _, rec = _ingest(anvil_review, tmp_path, {
+        "verdict": "fail", "summary": "nits", "checks_run": ["pytest"],
+        "findings": [{"severity": "low", "file": "x.py", "what": "w"}],
+    })
+    assert rec["verdict"] == "concern"
+    assert any("fail->concern" in n for n in rec["advisory"])
+
+
+def test_ingest_leaves_a_supported_fail_as_passed_zero(anvil_review, tmp_path):
+    _, rec = _ingest(anvil_review, tmp_path, {
+        "verdict": "fail", "summary": "real bug", "checks_run": ["pytest"],
+        "findings": [{"severity": "high", "file": "x.py", "what": "w"}],
+    })
+    assert rec["verdict"] == "fail"
+    assert rec["passed"] == 0
+
+
+def test_ingest_tolerates_a_missing_diff_and_says_so(anvil_review, tmp_path):
+    rc, rec = _ingest(anvil_review, tmp_path, {
+        "verdict": "pass", "summary": "s", "checks_run": ["pytest"], "findings": [],
+    }, diff=None)
+    assert rc == 0
+    assert rec["verdict"] == "pass"
+    assert any("diff file was unavailable" in n for n in rec["advisory"])
+
+
+def test_ingest_of_unparseable_json_is_an_error_stub(anvil_review, tmp_path):
+    _, rec = _ingest(anvil_review, tmp_path, "I could not produce JSON, sorry.")
+    assert rec["error"]
+    assert rec["passed"] == 0
+    assert rec["unverified"] is False   # no verdict to call unverified
+
+
+def test_ingest_extracts_a_fenced_verdict(anvil_review, tmp_path):
+    _, rec = _ingest(
+        anvil_review, tmp_path,
+        '```json\n{"verdict":"pass","summary":"s","checks_run":["pytest"],"findings":[]}\n```')
+    assert rec["error"] is None
+    assert rec["verdict"] == "pass"
+
+
+@pytest.mark.parametrize("payload", ["", "   \n  "])
+def test_ingest_with_no_verdict_to_read_exits_two(anvil_review, tmp_path, payload, capsys):
+    rc, _ = _ingest(anvil_review, tmp_path, payload)
+    assert rc == 2
+    assert "no verdict file to ingest" in capsys.readouterr().err
+
+
+def test_ingest_of_an_absent_file_exits_two(anvil_review, tmp_path):
+    (tmp_path / "d.patch").write_text("diff", encoding="utf-8")
+    assert anvil_review.main([
+        "--provider", "claude", "--task-id", "t",
+        "--diff-file", str(tmp_path / "d.patch"),
+        "--out", str(tmp_path / "nope.json"),
+    ]) == 2
+
+
+def test_ingest_never_consults_provider_enabled(anvil_review, tmp_path, monkeypatch):
+    """A reviewer switched off in config must not leave an unguarded file behind."""
+    def _boom(provider):
+        raise AssertionError("_provider_enabled must not run in ingest mode")
+    monkeypatch.setattr(anvil_review, "_provider_enabled", _boom)
+    rc, rec = _ingest(anvil_review, tmp_path, {
+        "verdict": "pass", "summary": "s", "checks_run": ["pytest"], "findings": [],
+    })
+    assert rc == 0 and rec["verdict"] == "pass"
+
+
+def test_checks_run_is_absent_from_http_provider_records(review):
+    """Providers with no shell cannot answer checks_run; demanding it invites invention."""
+    review.handler(lambda diff, truncated: ({"verdict": "pass", "summary": "s",
+                                             "findings": []}, "m"))
+    review.run()
+    assert "checks_run" not in review.record()
+    assert "unverified" not in review.record()
+
+
+def test_ingest_survives_a_diff_path_that_is_a_directory(anvil_review, tmp_path):
+    """An unreadable diff costs an advisory, never the verdict."""
+    out = tmp_path / "verdict.json"
+    out.write_text(json.dumps({"verdict": "pass", "summary": "s",
+                               "checks_run": ["pytest"], "findings": []}), encoding="utf-8")
+    bad_diff = tmp_path / "diffdir"
+    bad_diff.mkdir()
+    rc = anvil_review.main(["--provider", "claude", "--task-id", "t",
+                            "--diff-file", str(bad_diff), "--out", str(out)])
+    assert rc == 0
+    rec = json.loads(out.read_text(encoding="utf-8"))
+    assert rec["verdict"] == "pass"
+    assert any("diff file was unavailable" in n for n in rec["advisory"])

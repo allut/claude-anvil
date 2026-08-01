@@ -15,11 +15,23 @@ from the same baseline. Each provider is asked to return strict JSON:
                    "file": "path:line?",
                    "what": "...", "why": "...", "fix": "..."}]}
 
+A fourth reviewer, `claude`, is spawned by the /anvil loop as a Task subagent
+rather than called from here. `--provider claude` therefore runs in *ingest*
+mode: it re-reads the verdict file the subagent wrote and puts it through the
+same guards every HTTP provider's verdict goes through, rewriting the file in
+place. Before this existed, `claude` was the one reviewer whose verdict reached
+the ledger on nothing but "the file exists and parses".
+
 Usage:
     anvil-review.py --provider openai|gemini|ollama
                     --task-id TASK_ID
                     --diff-file PATH
                     [--out PATH]        # default <tmpdir>/anvil-review-{provider}-{task_id}.json (tmpdir via tempfile.gettempdir())
+
+    anvil-review.py --provider claude   # ingest: guard a verdict written elsewhere
+                    --task-id TASK_ID
+                    --diff-file PATH    # used for the off-diff advisory; tolerated if absent
+                    [--out PATH]        # the file to read AND rewrite
 
 Output:
     - Stdout: one line, e.g. "reviewer=openai verdict=pass findings=0 model=gpt-4o"
@@ -29,9 +41,12 @@ Output:
               1 for genuine pass/concern and the intentional disabled-skip stub.
               See compute_passed(). Also includes "advisory": a (possibly empty)
               list of strings naming incoherence the guard found in the reviewer's
-              own payload -- see apply_coherence_guard().
+              own payload -- see apply_coherence_guard(). Ingest mode adds
+              "checks_run" (commands the reviewer says it ran) and "unverified"
+              (true when it named none) -- see apply_provenance_guard().
     - Exit 0 always when a verdict file was written (real or stub).
-    - Exit 2 if the diff file is missing (no verdict can be produced).
+    - Exit 2 if the diff file is missing (no verdict can be produced), or, in
+      ingest mode, if there is no verdict file to ingest.
     Callers distinguish real from stub verdicts via the "error" field in the JSON output.
 
 Timeouts:
@@ -299,7 +314,10 @@ def _finding_severity(finding: object) -> str:
 def _normalize_path(raw: object) -> str:
     """Reduce a diff path or a finding's `file` to a bare comparable repo path."""
     p = str(raw or "").strip().replace("\\", "/")
-    p = re.sub(r":\d+(?::\d+)?$", "", p)  # trailing :line or :line:col
+    # Trailing :line, :line:col, or a :start-end range. Reviewers cite ranges
+    # routinely; leaving one attached made the path unmatchable and raised a
+    # false off-diff advisory against a file the diff plainly touches.
+    p = re.sub(r":\d+(?:-\d+)?(?::\d+(?:-\d+)?)?$", "", p)
     p = re.sub(r"^\./", "", p)
     p = re.sub(r"^[ab]/", "", p)  # git's a/ b/ prefixes
     return p.strip("/")
@@ -339,6 +357,61 @@ def _cites_a_diffed_file(finding_path: str, paths: set[str]) -> bool:
                 or finding_path.rsplit("/", 1)[-1] == p.rsplit("/", 1)[-1]):
             return True
     return False
+
+
+def normalize_checks_run(raw: object) -> list[str]:
+    """Coerce a reviewer's `checks_run` field to a list of non-empty command strings."""
+    if not isinstance(raw, list):
+        return []
+    out: list[str] = []
+    for item in raw:
+        if isinstance(item, (dict, list)):
+            continue
+        text = str(item).strip()
+        if text:
+            out.append(text)
+    return out
+
+
+def apply_provenance_guard(verdict: dict, checks_run: list[str]) -> tuple[dict, list[str], bool]:
+    """Return (possibly adjusted verdict, advisory notes, unverified flag).
+
+    Only meaningful for a reviewer that can execute commands (see
+    _EXECUTING_PROVIDERS). A reviewer with no shell cannot name commands it ran,
+    and demanding the field from one would only teach it to invent entries.
+
+    `checks_run` is **self-reported and is not a trust boundary.** An agent
+    willing to type '"verdict": "pass"' will type '"checks_run": ["pytest"]' just
+    as cheaply. What the field buys is narrower and still worth having: a clean
+    verdict that does not even *claim* work is no longer indistinguishable, in
+    the ledger, from one that does. Treat it as friction plus a legible
+    "unverified" state, never as proof the review happened.
+
+    Adjusts:
+      - "pass" with no checks_run -> "concern". Both map to passed=1, so this
+        keeps the guard family's invariant: it can never manufacture a FAIL row.
+
+    Annotates only:
+      - "fail"/"concern" with no checks_run. A "fail" is left standing: it
+        already means passed=0, and downgrading an unearned failure would hide a
+        real defect -- the opposite of the direction this guard errs in.
+    """
+    adjusted = dict(verdict)
+    if checks_run:
+        return adjusted, [], False
+    advisory: list[str] = []
+    if adjusted.get("verdict") == "pass":
+        adjusted["verdict"] = "concern"
+        advisory.append(
+            "verdict downgraded pass->concern (unverified): the reviewer named no command it "
+            "ran to reach a clean verdict; recorded as unverified rather than as a clean review"
+        )
+    else:
+        advisory.append(
+            f"verdict '{adjusted.get('verdict')}' reported with an empty checks_run: the reviewer "
+            "named no command it ran, so the verdict is unverified"
+        )
+    return adjusted, advisory, True
 
 
 def apply_coherence_guard(verdict: dict, diff: str = "",
@@ -643,16 +716,107 @@ PROVIDERS = {
     "ollama": call_ollama,
 }
 
+# Reviewers this script *calls*. The Claude reviewer is spawned by the /anvil loop
+# as a Task subagent instead, so it has no handler here -- but its verdict must
+# still go through the same guards as everyone else's, which is what the ingest
+# path below is for. Without it, `claude` was the one provider whose verdict the
+# ledger accepted on nothing but "the file exists and parses".
+_EXECUTING_PROVIDERS = {"claude"}  # reviewers with a shell, so checks_run is answerable
+
+
+# ---------- ingest (verdicts produced outside this script) --------------------
+
+def ingest_verdict(provider: str, task_id: str, in_path: Path,
+                   diff_path: Path | None) -> tuple[dict, Path]:
+    """Re-read a verdict written by a subagent and apply the same guards.
+
+    Returns (record, out_path). The file is rewritten in place: the loop reads
+    exactly one artifact, and there is no second, ungarded copy to pick up by
+    mistake. Raises FileNotFoundError when there is no verdict to ingest --
+    a missing file means the reviewer never ran, which is the caller's
+    review-loop-failure case, not a verdict.
+    """
+    text = in_path.read_text(encoding="utf-8", errors="replace") if in_path.exists() else ""
+    if not text.strip():
+        raise FileNotFoundError(str(in_path))
+
+    # An unreadable diff must never abort the ingest: the verdict is the artifact
+    # worth saving, and bailing here would leave the raw, unguarded file on disk --
+    # the exact outcome this path exists to prevent. The diff only feeds the
+    # off-diff advisory, so losing it costs an advisory, not a verdict.
+    diff, truncated, missing_diff = "", False, True
+    if diff_path is not None:
+        try:
+            diff, truncated = read_diff(diff_path)
+            missing_diff = False
+        except OSError:
+            diff, truncated = "", False
+
+    raw = extract_json(text)
+    error = None if isinstance(raw, dict) and raw else (
+        f"{provider} verdict file held no parseable JSON verdict"
+    )
+    verdict = normalize_verdict(raw, error or "reviewer returned no parseable verdict")
+    checks_run = normalize_checks_run(raw.get("checks_run")) if isinstance(raw, dict) else []
+
+    advisory: list[str] = []
+    unverified = False
+    if error is None:
+        verdict, advisory = apply_coherence_guard(verdict, diff, truncated)
+        if provider in _EXECUTING_PROVIDERS:
+            verdict, prov_advisory, unverified = apply_provenance_guard(verdict, checks_run)
+            advisory.extend(prov_advisory)
+        if missing_diff:
+            advisory.append(
+                "diff file was unavailable at ingest, so findings could not be checked "
+                "against the files this diff touches"
+            )
+
+    record = {
+        "provider": provider,
+        "model": "",
+        "task_id": task_id,
+        "truncated": truncated,
+        "error": error,
+        **verdict,
+        "checks_run": checks_run,
+        "unverified": unverified,
+        "advisory": advisory,
+        "passed": compute_passed(verdict["verdict"], error),
+    }
+    in_path.write_text(json.dumps(record, indent=2), encoding="utf-8")
+    return record, in_path
+
 
 # ---------- main -------------------------------------------------------------
 
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(prog="anvil-review.py")
-    parser.add_argument("--provider", required=True, choices=sorted(PROVIDERS))
+    parser.add_argument("--provider", required=True,
+                        choices=sorted(set(PROVIDERS) | _EXECUTING_PROVIDERS))
     parser.add_argument("--task-id", required=True)
     parser.add_argument("--diff-file", required=True)
     parser.add_argument("--out", default=None)
     args = parser.parse_args(argv)
+
+    # Ingest mode: the verdict already exists on disk, written by a subagent this
+    # script did not call. Deliberately ahead of the enabled check -- refusing to
+    # guard a verdict because the provider is switched off in config would leave
+    # the raw, unguarded file behind for the loop to read.
+    if args.provider in _EXECUTING_PROVIDERS:
+        in_path = Path(args.out) if args.out else default_out_path(args.provider, args.task_id)
+        try:
+            record, out_path = ingest_verdict(
+                args.provider, args.task_id, in_path, Path(args.diff_file))
+        except FileNotFoundError:
+            print(f"anvil-review: no verdict file to ingest: {in_path}", file=sys.stderr)
+            return 2
+        print(
+            f"reviewer={args.provider} verdict={record['verdict']} "
+            f"findings={len(record['findings'])} advisory={len(record['advisory'])} "
+            f"unverified={int(record['unverified'])} out={out_path}"
+        )
+        return 0
 
     if not _provider_enabled(args.provider):
         out_path = Path(args.out) if args.out else default_out_path(args.provider, args.task_id)
