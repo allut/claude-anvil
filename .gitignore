@@ -25,6 +25,13 @@ __pycache__/
 *.pyc
 *.pyo
 
+# Test / coverage artifacts
+.pytest_cache/
+.coverage
+.coverage.*
+htmlcov/
+coverage.xml
+
 # OS / editor
 .DS_Store
 Thumbs.db

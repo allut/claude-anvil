@@ -1,0 +1,3 @@
+# Contributor / CI only. The plugin itself needs nothing but the Python stdlib.
+pytest>=7.4
+pytest-cov>=4.1

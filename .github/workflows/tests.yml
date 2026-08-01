@@ -1,0 +1,66 @@
+name: tests
+
+on:
+  push:
+    branches: [master, main]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  pytest:
+    name: ${{ matrix.os }} / py${{ matrix.python }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        # 3.9 is the floor declared in README.md ("Python 3.9+"). Every script
+        # carries `from __future__ import annotations`, so the PEP 585/604
+        # annotations are safe there -- this matrix proves it instead of assuming.
+        os: [ubuntu-latest, windows-latest]
+        python: ["3.9", "3.13"]
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python }}
+
+      - name: Install dev dependencies
+        run: python -m pip install --upgrade pip && python -m pip install -r requirements-dev.txt
+
+      # hooks/hooks.json hardcodes `python3`. On Linux that is a given; on
+      # Windows it is exactly the portability wrinkle worth surfacing, so the
+      # check runs on both legs and only warns on Windows.
+      - name: Check for python3 on PATH (Linux)
+        if: runner.os == 'Linux'
+        run: python3 --version
+
+      - name: Check for python3 on PATH (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        continue-on-error: true
+        run: |
+          $cmd = Get-Command python3 -ErrorAction SilentlyContinue
+          if ($null -eq $cmd) {
+            Write-Warning "python3 is not on PATH; plugin/hooks/hooks.json hardcodes it."
+          } else {
+            Write-Host "python3 -> $($cmd.Source)"
+          }
+
+      - name: Run tests
+        run: python -m pytest --cov --cov-report=term-missing
+
+      # No test is marked `network`, so this must collect nothing. pytest signals
+      # "no tests collected" with exit code 5, which is the success case here.
+      - name: Assert the network marker selects no tests
+        shell: bash
+        run: |
+          set +e
+          python -m pytest -m network --collect-only -q
+          code=$?
+          set -e
+          if [ "$code" -ne 5 ]; then
+            echo "expected exit 5 (no tests collected), got $code"
+            exit 1
+          fi

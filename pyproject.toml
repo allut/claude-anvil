@@ -1,0 +1,22 @@
+# Test/coverage configuration ONLY.
+#
+# There is deliberately no [build-system] and no [project] table: claude-anvil is
+# a Claude Code plugin, not a pip-installable package. Its runtime promise is
+# "stdlib only, no pip install" — adding a build backend here would imply
+# otherwise. pytest is a contributor/CI dependency (requirements-dev.txt).
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-q --strict-markers -m 'not network'"
+markers = [
+    "network: makes real network calls (deselected by default)",
+]
+
+[tool.coverage.run]
+source = ["plugin/scripts"]
+# Note: the two hooks and most of anvil-ledger.py are exercised out of process
+# (subprocess CLI contract tests), and coverage does not follow child processes
+# by default -- their reported percentage understates the real coverage.
+
+[tool.coverage.report]
+show_missing = true
