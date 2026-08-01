@@ -13,7 +13,7 @@ import urllib.error
 import pytest
 
 RECORD_KEYS = {"provider", "model", "task_id", "truncated", "error",
-               "verdict", "summary", "findings", "passed"}
+               "verdict", "summary", "findings", "advisory", "passed"}
 
 
 @pytest.fixture
@@ -63,7 +63,7 @@ def http_error(code, body=b"", reason="Reason"):
 
 # --- happy path ---------------------------------------------------------------
 
-def test_successful_review_writes_the_nine_key_record(review, capsys):
+def test_successful_review_writes_the_ten_key_record(review, capsys):
     review.handler(lambda diff, truncated: (
         {"verdict": "concern", "summary": "two nits",
          "findings": [{"severity": "low"}, {"severity": "medium"}]}, "gpt-4o"))
@@ -79,18 +79,51 @@ def test_successful_review_writes_the_nine_key_record(review, capsys):
     assert record["verdict"] == "concern"
     assert record["passed"] == 1
     assert len(record["findings"]) == 2
+    assert record["advisory"] == []
 
     assert capsys.readouterr().out.strip() == (
-        f"reviewer=openai verdict=concern findings=2 model=gpt-4o out={review.out_file}")
+        f"reviewer=openai verdict=concern findings=2 advisory=0 "
+        f"model=gpt-4o out={review.out_file}")
 
 
 def test_fail_verdict_records_passed_zero(review):
-    review.handler(lambda d, t: ({"verdict": "fail", "summary": "broken"}, "m"))
+    review.handler(lambda d, t: (
+        {"verdict": "fail", "summary": "broken",
+         "findings": [{"severity": "high", "what": "boom"}]}, "m"))
     assert review.run() == 0
     record = review.record()
     assert record["verdict"] == "fail"
     assert record["passed"] == 0
     assert record["error"] is None
+    assert record["advisory"] == []
+
+
+def test_an_unsupported_fail_is_downgraded_before_reaching_the_ledger(review, capsys):
+    """Regression guard: a `fail` whose findings are all non-high used to write a
+    passed=0 row asserting the code is broken. It is now `concern`/passed=1 with
+    an advisory, and the note is echoed to stderr so the loop cannot miss it."""
+    review.handler(lambda d, t: (
+        {"verdict": "fail", "summary": "the diff resolves several bugs",
+         "findings": [{"severity": "medium", "what": "x"}]}, "m"))
+    assert review.run() == 0
+    record = review.record()
+    assert record["verdict"] == "concern"
+    assert record["passed"] == 1
+    assert len(record["advisory"]) == 1
+    out, err = capsys.readouterr()
+    assert "advisory=1" in out
+    assert "downgraded fail->concern" in err
+
+
+def test_findings_outside_the_diff_are_flagged_but_still_recorded(review):
+    review.handler(lambda d, t: (
+        {"verdict": "fail", "summary": "s",
+         "findings": [{"severity": "high", "file": "totally/unrelated.py:4"}]}, "m"))
+    assert review.run() == 0
+    record = review.record()
+    assert record["verdict"] == "fail"          # a high finding still supports `fail`
+    assert record["passed"] == 0
+    assert any("does not touch" in a for a in record["advisory"])
 
 
 def test_handler_receives_the_diff_text(review):
@@ -148,6 +181,8 @@ def test_disabled_provider_writes_a_passing_stub_and_exits_zero(
     assert record["passed"] == 1            # the intentional disabled-skip stub
     assert "disabled in config" in record["error"]
     assert record["findings"] == []
+    assert set(record) == RECORD_KEYS
+    assert record["advisory"] == []
     assert "model=disabled" in capsys.readouterr().out
 
 
@@ -219,6 +254,16 @@ def test_unexpected_exceptions_hit_the_catch_all(review):
     record = review.record()
     assert record["error"] == "openai error: KeyError('choices')"
     assert record["passed"] == 0
+
+
+def test_stub_verdicts_carry_no_advisory(review):
+    """The guard is skipped when `error` is set. Stubs synthesize `concern` with no
+    findings, so running it would emit an empty-findings note on every outage."""
+    review.raises(RuntimeError("nope"))
+    review.run()
+    record = review.record()
+    assert record["verdict"] == "concern" and record["findings"] == []
+    assert record["advisory"] == []
 
 
 def test_the_model_falls_back_to_the_configured_one_when_the_call_fails(review):

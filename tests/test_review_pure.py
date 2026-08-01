@@ -148,6 +148,195 @@ def test_normalize_verdict_output_has_exactly_three_keys(anvil_review):
         {"verdict", "summary", "findings"}
 
 
+# --- diff_paths / _normalize_path ---------------------------------------------
+
+def test_normalize_path_strips_git_prefix_and_line_number(anvil_review):
+    assert anvil_review._normalize_path("b/plugin/scripts/x.py:42") == "plugin/scripts/x.py"
+    assert anvil_review._normalize_path("a/x.py:42:7") == "x.py"
+    assert anvil_review._normalize_path("./x.py") == "x.py"
+    assert anvil_review._normalize_path("plugin\\scripts\\x.py") == "plugin/scripts/x.py"
+    assert anvil_review._normalize_path(None) == ""
+
+
+def test_diff_paths_collects_both_sides_and_drops_dev_null(anvil_review):
+    diff = (
+        "diff --git a/plugin/scripts/x.py b/plugin/scripts/x.py\n"
+        "--- a/plugin/scripts/x.py\n+++ b/plugin/scripts/x.py\n"
+        "diff --git a/gone.py b/gone.py\n--- a/gone.py\n+++ /dev/null\n"
+    )
+    assert anvil_review.diff_paths(diff) == {"plugin/scripts/x.py", "gone.py"}
+
+
+def test_diff_paths_on_an_empty_diff_is_empty(anvil_review):
+    assert anvil_review.diff_paths("") == set()
+
+
+def test_cites_a_diffed_file_matches_leniently(anvil_review):
+    paths = {"plugin/scripts/anvil-review.py"}
+    for cited in ("plugin/scripts/anvil-review.py", "anvil-review.py",
+                  "repo/plugin/scripts/anvil-review.py", ""):
+        assert anvil_review._cites_a_diffed_file(cited, paths) is True
+    assert anvil_review._cites_a_diffed_file("tests/test_other.py", paths) is False
+
+
+# --- apply_coherence_guard ----------------------------------------------------
+
+def _v(verdict, findings=(), summary="s"):
+    return {"verdict": verdict, "summary": summary, "findings": list(findings)}
+
+
+def _f(severity, file="x.py"):
+    return {"severity": severity, "file": file, "what": "w", "why": "y", "fix": "f"}
+
+
+def test_guard_downgrades_fail_without_a_high_finding(anvil_review):
+    """The reported bug: six non-high findings paired with `fail` produced a FAIL
+    ledger row for code the reviewer's own summary praised."""
+    out, advisory = anvil_review.apply_coherence_guard(
+        _v("fail", [_f("medium"), _f("low")]))
+    assert out["verdict"] == "concern"
+    assert anvil_review.compute_passed(out["verdict"], None) == 1
+    assert len(advisory) == 1 and "downgraded fail->concern" in advisory[0]
+
+
+def test_guard_keeps_fail_when_a_high_finding_supports_it(anvil_review):
+    out, advisory = anvil_review.apply_coherence_guard(_v("fail", [_f("high"), _f("low")]))
+    assert out["verdict"] == "fail"
+    assert advisory == []
+
+
+def test_guard_severity_match_is_case_and_space_insensitive(anvil_review):
+    out, advisory = anvil_review.apply_coherence_guard(
+        _v("fail", [{"severity": " HIGH ", "file": "x.py"}]))
+    assert out["verdict"] == "fail" and advisory == []
+
+
+@pytest.mark.parametrize("label", ["critical", "blocker", "SEV-1", "hi"])
+def test_guard_treats_an_unrecognized_severity_as_high(anvil_review, label):
+    """A vocabulary drift upstream (prompt tweak, provider quirk) must not silently
+    downgrade a genuine failure to passed=1 -- the outcome the guard exists to stop."""
+    out, advisory = anvil_review.apply_coherence_guard(_v("fail", [_f(label)]))
+    assert out["verdict"] == "fail"
+    assert anvil_review.compute_passed(out["verdict"], None) == 0
+    assert len(advisory) == 1
+    assert "outside the high/medium/low schema" in advisory[0] and label.lower() in advisory[0]
+
+
+def test_guard_upgrades_pass_carrying_an_unrecognized_severity(anvil_review):
+    out, advisory = anvil_review.apply_coherence_guard(_v("pass", [_f("critical")]))
+    assert out["verdict"] == "concern"
+    assert any("upgraded pass->concern" in a for a in advisory)
+
+
+def test_guard_does_not_treat_a_missing_severity_as_a_drifted_label(anvil_review):
+    """Absent/empty severity is not a vocabulary drift; it must not prop up a `fail`."""
+    out, advisory = anvil_review.apply_coherence_guard(
+        _v("fail", [{"file": "x.py", "what": "w"}, {"severity": "  ", "file": "x.py"}]))
+    assert out["verdict"] == "concern"
+    assert not any("outside the high/medium/low schema" in a for a in advisory)
+
+
+def test_guard_truncates_a_long_unrecognized_severity_list(anvil_review):
+    findings = [_f(f"sev{i}") for i in range(anvil_review._MAX_ADVISORY_SEVERITIES + 2)]
+    _, advisory = anvil_review.apply_coherence_guard(_v("fail", findings))
+    note = next(a for a in advisory if "outside the high/medium/low schema" in a)
+    assert "(+2 more)" in note
+
+
+def test_guard_upgrades_pass_carrying_a_high_finding(anvil_review):
+    """The silent inverse of the reported bug — a false clean verdict."""
+    out, advisory = anvil_review.apply_coherence_guard(_v("pass", [_f("high")]))
+    assert out["verdict"] == "concern"
+    assert anvil_review.compute_passed(out["verdict"], None) == 1  # never manufactures a FAIL
+    assert "upgraded pass->concern" in advisory[0]
+
+
+def test_guard_only_annotates_pass_with_medium_findings(anvil_review):
+    out, advisory = anvil_review.apply_coherence_guard(_v("pass", [_f("medium")]))
+    assert out["verdict"] == "pass"
+    assert len(advisory) == 1 and "medium-severity" in advisory[0]
+
+
+def test_guard_leaves_a_clean_pass_alone(anvil_review):
+    out, advisory = anvil_review.apply_coherence_guard(_v("pass"))
+    assert out == _v("pass") and advisory == []
+
+
+def test_guard_ignores_low_findings_under_pass(anvil_review):
+    out, advisory = anvil_review.apply_coherence_guard(_v("pass", [_f("low")]))
+    assert out["verdict"] == "pass" and advisory == []
+
+
+def test_guard_flags_a_negative_verdict_with_no_findings(anvil_review):
+    _, advisory = anvil_review.apply_coherence_guard(_v("concern"))
+    assert any("empty findings array" in a for a in advisory)
+
+
+def test_guard_reports_both_the_downgrade_and_the_empty_findings(anvil_review):
+    out, advisory = anvil_review.apply_coherence_guard(_v("fail"))
+    assert out["verdict"] == "concern"
+    assert len(advisory) == 2
+
+
+def test_guard_flags_findings_about_files_outside_the_diff(anvil_review):
+    diff = "diff --git a/x.py b/x.py\n--- a/x.py\n+++ b/x.py\n+line\n"
+    _, advisory = anvil_review.apply_coherence_guard(
+        _v("concern", [_f("low", "x.py:3"), _f("low", "elsewhere/other.py:9")]), diff)
+    note = next(a for a in advisory if "does not touch" in a)
+    assert "elsewhere/other.py:9" in note and "x.py:3" not in note
+
+
+def test_guard_skips_the_off_diff_check_on_a_truncated_diff(anvil_review):
+    """`diff` is only the first DIFF_HARD_LIMIT chars when truncated, so files whose
+    header falls past the cutoff would be wrongly reported as untouched."""
+    diff = "diff --git a/x.py b/x.py\n--- a/x.py\n+++ b/x.py\n+line\n"
+    _, advisory = anvil_review.apply_coherence_guard(
+        _v("concern", [_f("low", "tail/only.py:9")]), diff, truncated=True)
+    assert not any("does not touch" in a for a in advisory)
+    # ...and it still fires when the reviewer saw the whole diff.
+    _, advisory = anvil_review.apply_coherence_guard(
+        _v("concern", [_f("low", "tail/only.py:9")]), diff, truncated=False)
+    assert any("does not touch" in a for a in advisory)
+
+
+def test_guard_does_not_flag_off_diff_files_when_no_paths_parsed(anvil_review):
+    _, advisory = anvil_review.apply_coherence_guard(
+        _v("concern", [_f("low", "anything.py")]), "not a diff at all")
+    assert not any("does not touch" in a for a in advisory)
+
+
+def test_guard_truncates_a_long_off_diff_file_list(anvil_review):
+    diff = "diff --git a/x.py b/x.py\n"
+    findings = [_f("low", f"far/f{i}.py") for i in range(anvil_review._MAX_ADVISORY_FILES + 3)]
+    _, advisory = anvil_review.apply_coherence_guard(_v("concern", findings), diff)
+    note = next(a for a in advisory if "does not touch" in a)
+    assert "(+3 more)" in note
+
+
+def test_guard_does_not_mutate_the_input_verdict(anvil_review):
+    original = _v("fail", [_f("low")])
+    anvil_review.apply_coherence_guard(original)
+    assert original["verdict"] == "fail"
+
+
+def test_guard_tolerates_malformed_findings(anvil_review):
+    """Findings come straight from a model; normalize_verdict only checks the list type."""
+    out, advisory = anvil_review.apply_coherence_guard(
+        {"verdict": "fail", "summary": "s", "findings": ["a string", None, 42]})
+    assert out["verdict"] == "concern"
+    assert isinstance(advisory, list)
+
+
+# --- SHARED_PROMPT ------------------------------------------------------------
+
+def test_shared_prompt_forbids_reporting_bugs_the_diff_fixes(anvil_review):
+    """The primary defence against a reviewer transcribing the diff's own changelog."""
+    p = anvil_review.SHARED_PROMPT
+    assert "AFTER this diff is applied" in p
+    assert "Do NOT list bugs the diff fixes." in p
+    assert "verdict must agree with your summary" in p
+
+
 # --- _env_float ---------------------------------------------------------------
 
 def test_env_float_reads_a_valid_value(anvil_review, monkeypatch):

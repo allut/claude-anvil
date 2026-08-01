@@ -27,7 +27,9 @@ Output:
               "passed" (0|1) machine signal for the ledger: 0 for a real
               stub/outage (error set and verdict != "pass") or a "fail" verdict,
               1 for genuine pass/concern and the intentional disabled-skip stub.
-              See compute_passed().
+              See compute_passed(). Also includes "advisory": a (possibly empty)
+              list of strings naming incoherence the guard found in the reviewer's
+              own payload -- see apply_coherence_guard().
     - Exit 0 always when a verdict file was written (real or stub).
     - Exit 2 if the diff file is missing (no verdict can be produced).
     Callers distinguish real from stub verdicts via the "error" field in the JSON output.
@@ -122,6 +124,15 @@ SHARED_PROMPT = (
     "Ignore: style, formatting, naming preferences.\n"
     "For each issue, give: what the bug is, why it matters, and a concrete fix.\n"
     "If nothing is wrong, say so explicitly with an empty findings array.\n\n"
+    "Report ONLY defects that still exist in the code AFTER this diff is applied.\n"
+    "Do NOT list bugs the diff fixes. Do NOT restate the diff's own comments,\n"
+    "docstrings or documentation as findings -- a diff that explains the bugs it\n"
+    "repairs is not a diff full of bugs. Before emitting each finding, confirm it\n"
+    "points at a line the diff adds or leaves in place; if it describes a line the\n"
+    "diff removes, drop it.\n"
+    "Your verdict must agree with your summary: do not pair an approving summary\n"
+    "with a 'fail' verdict. If you find no surviving defects, return\n"
+    '"verdict": "pass" with an empty findings array.\n\n'
     "Output STRICT JSON ONLY, no markdown fences, no prose before or after.\n"
     "Schema:\n"
     '{"verdict": "pass" | "concern" | "fail",\n'
@@ -133,6 +144,8 @@ SHARED_PROMPT = (
     '               "fix": "..." } ] }\n\n'
     "'pass' = nothing actionable. 'concern' = non-blocking issues. 'fail' = at\n"
     "least one high-severity issue the author should address before merging.\n"
+    "A 'fail' carrying no high-severity finding is automatically downgraded to\n"
+    "'concern', so do not use 'fail' as a generic negative signal.\n"
 )
 
 DIFF_HARD_LIMIT = 120_000  # characters -- keeps large PR diffs tractable for any model
@@ -258,6 +271,159 @@ def normalize_verdict(raw: dict | None, fallback_summary: str) -> dict:
         "summary": str(raw.get("summary") or fallback_summary),
         "findings": findings,
     }
+
+
+# ---------- coherence guard --------------------------------------------------
+#
+# A reviewer can return well-formed JSON that is nonetheless self-contradictory:
+# an approving summary paired with "verdict": "fail", or findings that describe
+# bugs *this diff repairs* rather than defects that survive it. Both shapes pass
+# every structural check and land in the ledger as an authoritative passed=0 row.
+# The ledger's whole value is that it cannot be hallucinated, so an incoherent
+# payload must be visibly flagged rather than silently trusted.
+#
+# The guard corrects only what the documented schema already decides (a "fail"
+# means at least one high-severity finding) and otherwise *annotates*: reviewer
+# quality is not verifiable from inside the loop, so anything else becomes an
+# advisory string for the /anvil loop and the user to weigh.
+
+_MAX_ADVISORY_FILES = 5  # keep the off-diff advisory readable on very noisy verdicts
+_MAX_ADVISORY_SEVERITIES = 5
+_SEVERITY_VOCAB = {"high", "medium", "low"}
+
+
+def _finding_severity(finding: object) -> str:
+    return str(finding.get("severity", "")).strip().lower() if isinstance(finding, dict) else ""
+
+
+def _normalize_path(raw: object) -> str:
+    """Reduce a diff path or a finding's `file` to a bare comparable repo path."""
+    p = str(raw or "").strip().replace("\\", "/")
+    p = re.sub(r":\d+(?::\d+)?$", "", p)  # trailing :line or :line:col
+    p = re.sub(r"^\./", "", p)
+    p = re.sub(r"^[ab]/", "", p)  # git's a/ b/ prefixes
+    return p.strip("/")
+
+
+_DIFF_GIT_RE = re.compile(r"^diff --git a/(.+?) b/(.+)$", re.MULTILINE)
+_DIFF_HEADER_RE = re.compile(r"^(?:\+\+\+|---) (?:[ab]/)?(.+)$", re.MULTILINE)
+
+
+def diff_paths(diff: str) -> set[str]:
+    """Every file path the diff appears to touch, normalized.
+
+    Deliberately over-collects: the `+++`/`---` pattern also matches a *content*
+    line that happens to start with `+++ ` or `--- `. Over-collecting only makes
+    the off-diff advisory more permissive (fewer flags), never more accusatory,
+    which is the safe direction for a heuristic that can produce false alarms.
+    """
+    paths: set[str] = set()
+    for m in _DIFF_GIT_RE.finditer(diff or ""):
+        paths.add(_normalize_path(m.group(1)))
+        paths.add(_normalize_path(m.group(2)))
+    for m in _DIFF_HEADER_RE.finditer(diff or ""):
+        paths.add(_normalize_path(m.group(1)))
+    paths.discard("")
+    paths.discard("dev/null")
+    return paths
+
+
+def _cites_a_diffed_file(finding_path: str, paths: set[str]) -> bool:
+    """Lenient path match. Absent/unmatchable paths count as cited (never accuse)."""
+    if not finding_path:
+        return True
+    for p in paths:
+        if (finding_path == p
+                or p.endswith("/" + finding_path)
+                or finding_path.endswith("/" + p)
+                or finding_path.rsplit("/", 1)[-1] == p.rsplit("/", 1)[-1]):
+            return True
+    return False
+
+
+def apply_coherence_guard(verdict: dict, diff: str = "",
+                          truncated: bool = False) -> tuple[dict, list[str]]:
+    """Return (possibly adjusted verdict, advisory notes).
+
+    Adjusts (schema-mandated, deterministic):
+      - "fail" with no high-severity finding -> "concern".
+      - "pass" with a high-severity finding  -> "concern". Both "pass" and
+        "concern" map to passed=1, so this never manufactures a FAIL row.
+
+    A finding whose `severity` is a non-empty string outside {high, medium, low}
+    ("critical", "blocker", a typo) counts as high for both rules and raises its
+    own advisory. Anything else would let a vocabulary drift upstream -- a prompt
+    tweak, a provider quirk -- silently downgrade a genuine failure to passed=1,
+    which is the very outcome this guard exists to prevent. An absent or empty
+    severity is not a drifted label and does not count as high.
+    Annotates only (no adjustment):
+      - "pass" alongside medium-severity findings.
+      - "fail"/"concern" with an empty findings array.
+      - findings citing files the diff does not touch. This is a *proxy* for
+        "the finding describes a removed line": it catches a reviewer narrating
+        code outside the change set, but not one narrating a fixed bug inside a
+        file the diff does touch. The prompt is the primary defence there.
+        Suppressed entirely when `truncated` is set: `diff` is then only the
+        first DIFF_HARD_LIMIT characters, so every file whose header falls past
+        the cutoff would be reported as untouched and a legitimate finding about
+        the tail of a large diff would be talked down as off-diff chatter.
+
+    Callers must skip this for stub verdicts (`error` set): those synthesize
+    "concern" with no findings, which would trip the empty-findings note on
+    every outage and drown the real signal.
+    """
+    adjusted = dict(verdict)
+    advisory: list[str] = []
+    findings = adjusted.get("findings") or []
+    severities = {_finding_severity(f) for f in findings}
+    unrecognized = sorted(s for s in severities if s and s not in _SEVERITY_VOCAB)
+    if unrecognized:
+        shown = ", ".join(unrecognized[:_MAX_ADVISORY_SEVERITIES])
+        more = (f" (+{len(unrecognized) - _MAX_ADVISORY_SEVERITIES} more)"
+                if len(unrecognized) > _MAX_ADVISORY_SEVERITIES else "")
+        advisory.append(
+            "finding(s) use severity label(s) outside the high/medium/low schema, counted "
+            f"as high severity so a real failure is not downgraded: {shown}{more}"
+        )
+    # Unrecognized labels count as high: erring toward "blocking" keeps a genuine
+    # fail intact; erring the other way is a false clean verdict.
+    has_high = "high" in severities or bool(unrecognized)
+    current = adjusted.get("verdict")
+
+    if current == "fail" and not has_high:
+        adjusted["verdict"] = current = "concern"
+        advisory.append(
+            f"verdict downgraded fail->concern: 'fail' requires at least one high-severity "
+            f"finding, but none of the {len(findings)} reported finding(s) is high severity"
+        )
+    elif current == "pass" and has_high:
+        adjusted["verdict"] = current = "concern"
+        advisory.append(
+            "verdict upgraded pass->concern: the reviewer reported high-severity finding(s) "
+            "while calling the diff clean"
+        )
+    elif current == "pass" and "medium" in severities:
+        advisory.append("verdict 'pass' reported alongside medium-severity finding(s)")
+
+    if current in {"fail", "concern"} and not findings:
+        advisory.append(f"verdict '{current}' reported with an empty findings array")
+
+    paths = set() if truncated else diff_paths(diff)
+    if paths:
+        off = sorted({
+            str(f.get("file"))
+            for f in findings
+            if isinstance(f, dict) and f.get("file")
+            and not _cites_a_diffed_file(_normalize_path(f.get("file")), paths)
+        })
+        if off:
+            shown = ", ".join(off[:_MAX_ADVISORY_FILES])
+            more = f" (+{len(off) - _MAX_ADVISORY_FILES} more)" if len(off) > _MAX_ADVISORY_FILES else ""
+            advisory.append(
+                "finding(s) cite files this diff does not touch, so they may describe "
+                f"pre-existing or already-fixed code rather than a defect in the diff: {shown}{more}"
+            )
+    return adjusted, advisory
 
 
 # Transient upstream failures worth retrying (rate limits, gateway/overload errors).
@@ -499,11 +665,13 @@ def main(argv: list[str] | None = None) -> int:
             "verdict": "pass",
             "summary": f"{args.provider} skipped (enabled=false); no findings",
             "findings": [],
+            "advisory": [],
             "passed": compute_passed("pass", f"{args.provider} is disabled in config (enabled=false)"),
         }
         out_path.parent.mkdir(parents=True, exist_ok=True)
         out_path.write_text(json.dumps(stub, indent=2), encoding="utf-8")
-        print(f"reviewer={args.provider} verdict=pass findings=0 model=disabled out={out_path}")
+        print(f"reviewer={args.provider} verdict=pass findings=0 advisory=0 "
+              f"model=disabled out={out_path}")
         return 0
 
     diff_path = Path(args.diff_file)
@@ -552,6 +720,11 @@ def main(argv: list[str] | None = None) -> int:
 
     fallback_summary = error or "reviewer returned no parseable verdict"
     verdict = normalize_verdict(raw, fallback_summary)
+    # Only genuine verdicts go through the guard; stubs synthesize "concern" with no
+    # findings and would trip the empty-findings note on every outage.
+    advisory: list[str] = []
+    if error is None:
+        verdict, advisory = apply_coherence_guard(verdict, diff, truncated)
     record = {
         "provider": args.provider,
         "model": model,
@@ -559,6 +732,7 @@ def main(argv: list[str] | None = None) -> int:
         "truncated": truncated,
         "error": error,
         **verdict,
+        "advisory": advisory,
         "passed": compute_passed(verdict["verdict"], error),
     }
 
@@ -567,9 +741,11 @@ def main(argv: list[str] | None = None) -> int:
 
     print(
         f"reviewer={args.provider} verdict={record['verdict']} "
-        f"findings={len(record['findings'])} model={model or 'unknown'} "
-        f"out={out_path}"
+        f"findings={len(record['findings'])} advisory={len(advisory)} "
+        f"model={model or 'unknown'} out={out_path}"
     )
+    for note in advisory:
+        print(f"anvil-review: advisory ({args.provider}): {note}", file=sys.stderr)
     return 0
 
 

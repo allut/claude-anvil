@@ -358,8 +358,13 @@ The reviewer JSON schema (both Claude and external providers use the same schema
 | `findings[].what` | string | What the problem is |
 | `findings[].why` | string | Why it matters |
 | `findings[].fix` | string | Concrete fix |
+| `advisory` | string[] | External providers only. Incoherence `anvil-review.py` found in the reviewer's own payload. Empty list = coherent. |
 
 There is no `description` or `location` field. Use `what` and `file` for findings text and location.
+
+**Reviewers contradict themselves, and the ledger cannot tell.** A reviewer can return well-formed JSON whose findings describe bugs *the diff fixes* — transcribing the diff's own documentation — and pair them with a `fail` verdict, producing an authoritative `passed=0` row against code the reviewer actually praised. `anvil-review.py` applies a coherence guard (`apply_coherence_guard`): it downgrades a `fail` carrying no high-severity finding to `concern`, upgrades a `pass` carrying a high-severity finding to `concern`, and writes an `advisory` list for anything else it cannot decide. The guard only *flags*; you still have to read the verdict.
+
+**Before inserting any reviewer verdict, read its `summary` and `findings`.** If a finding describes a line the diff removes rather than one it adds, it is not a defect in this change — discount it, and say so in the Evidence Bundle rather than treating the row as a real failure. If `advisory` is non-empty, quote each note in the Evidence Bundle's Adversarial Review section. Never insert a silent `passed=0` for a verdict you have not read.
 
 **External reviewer calls (Bash, run in parallel with the Task call):**
 
@@ -381,6 +386,9 @@ d=json.load(open(sys.argv[1]))
 p=d.get('passed')
 if p is None: p = 0 if d.get('verdict','fail')=='fail' else 1
 print(int(p))" "$_VERDICT_FILE" 2>/dev/null || echo 0)
+    # Surface coherence advisories so they cannot be lost between the JSON file and the bundle.
+    python3 -c "import json,sys
+for n in (json.load(open(sys.argv[1])).get('advisory') or []): print('ADVISORY:', n)" "$_VERDICT_FILE" 2>/dev/null || true
     python3 "${CLAUDE_PLUGIN_ROOT}/scripts/anvil-ledger.py" insert-check \
       --task-id "$TASK_ID" --phase review \
       --check "review-${_P}" --tool "anvil-review" \

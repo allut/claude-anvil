@@ -32,6 +32,8 @@ The caller will tell you:
 2. For each hunk, trace what was added/removed. If a changed symbol is defined or called elsewhere, `Grep` the repo to see the blast radius.
 3. Be adversarial. If the diff looks clean, try harder to find a failure mode before saying pass. But never invent issues -- false positives erode trust.
 4. Prefer fewer, higher-quality findings over a list of nits.
+5. Report **only defects that still exist after this diff is applied**. Do not list bugs the diff fixes, and do not restate the diff's own comments, docstrings or documentation as findings -- a diff that explains the bugs it repairs is not a diff full of bugs. Before emitting each finding, confirm it points at a line the diff adds or leaves in place; if it describes a removed line, drop it.
+6. Your verdict must agree with your summary. Never pair an approving summary with a `fail` verdict.
 
 ## How to report
 
@@ -55,7 +57,7 @@ Write STRICT JSON ONLY to the `out_file` path, with no markdown fences:
 
 - `pass` = nothing actionable found.
 - `concern` = non-blocking issues worth flagging but not blockers.
-- `fail` = at least one high-severity issue the author should address before merging.
+- `fail` = at least one high-severity issue the author should address before merging. Do not use `fail` as a generic negative signal: a `fail` with no high-severity finding is incoherent and the loop treats it as `concern`.
 
 Use `Bash` with a heredoc to write the file. Example:
 
