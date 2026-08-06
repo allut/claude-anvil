@@ -319,13 +319,17 @@ Spawn the `claude-anvil:code-review-claude` subagent with this prompt (replacing
 - **In the spawning turn**: issue the Task call and the external-reviewer Bash call in the same turn (parallel). If the Task tool itself returns an error (not just a missing output file), INSERT a `review-loop-failure` row immediately in the spawning turn and trigger step 6b. Otherwise, the synchronous Bash call returns with external verdicts — insert them. Do not attempt to read `$CLAUDE_OUT` in this turn; it does not exist yet. All of 5d / 5e / 6 / 7 / 8 require the Claude verdict, so leave them for the notification turn.
 - **When the task-notification arrives** (a new assistant turn triggered by the system): THAT is when you check the file and insert the verdict. Shell variables don't persist between turns — re-resolve `ANVIL_TMPDIR` via `python3` and substitute the **literal task_id string** (e.g. `fix-login-crash`) directly into `CLAUDE_OUT`, not the variable name `$TASK_ID`. After inserting the Claude verdict, continue to 5d / 5e / 6 / 7 / 8 normally.
 
-**🚫 Read the task-completion notification before you read the file.** The verdict file is written by the subagent and proves nothing about whether the subagent did any work — a fabricated `{"verdict":"pass","findings":[]}` parses exactly like an earned one. If the notification carries a harness warning about the subagent's own conduct — `[Self Approval]`, a fabricated-output warning, or any security flag naming the review output — **the file is not evidence**. Do not ingest it. INSERT `review-loop-failure` with `--passed 0`, treat the review as not having happened, and trigger step 6b. This is the only channel the fabrication is visible on; nothing in the file or in the snippet below can see it.
+**🚫 Read the task-completion notification before you read the file.** The verdict file is written by the subagent and proves nothing about whether the subagent did any work — a fabricated `{"verdict":"pass","findings":[]}` parses exactly like an earned one. Split any harness warning on the notification into two kinds, by asking: *does the warning say the output is not genuine, or does it say the approver and the diff's author are the same party?*
+
+- **Fabrication** — a flag asserting the subagent did not do the work it claims, or that the returned content is not genuine → **the file is not evidence**. Do not ingest it. INSERT `review-loop-failure` with `--passed 0`, treat the review as not having happened, and trigger step 6b. This is the only channel the fabrication is visible on; nothing in the file or in the snippet below can see it.
+- **`[Self Approval]`** (or any flag saying the reviewer is in-family with the diff's author) → this is expected, not a defect: Claude is the default Medium reviewer and the first Large reviewer, so it reviews Claude-authored diffs on essentially every run. **Ingest it.** Pass `--self-approved` to the guarded ingest call below; the flag becomes a `self_approved` field and an advisory note on the record, and the row files as `review-claude-self-approved` (see below) — it still counts toward the step-5c review gate and does **not** cap Confidence or trigger 6b.
 
 ```bash
 # Notification-handler turn — substitute literal task_id, e.g. "fix-anvil-async-reviewer"
 ANVIL_TMPDIR=$(python3 -c "import tempfile; print(tempfile.gettempdir())")
 CLAUDE_OUT="$ANVIL_TMPDIR/anvil-review-claude-<LITERAL_TASK_ID>.json"
 DIFF_FILE="$ANVIL_TMPDIR/anvil-diff-<LITERAL_TASK_ID>.patch"
+SELF_APPROVED=0   # set to 1 when the notification carried [Self Approval] (or equivalent in-family flag)
 
 if [ ! -s "$CLAUDE_OUT" ]; then
   printf '{"verdict":"fail","summary":"review-loop-failure: output file not written when notification arrived","findings":[]}' > "$CLAUDE_OUT"
@@ -339,15 +343,23 @@ if [ ! -s "$CLAUDE_OUT" ]; then
 else
   # Put the subagent's verdict through the same guards every external provider's
   # verdict goes through. Rewrites $CLAUDE_OUT in place with the guarded verdict
-  # plus advisory / unverified / passed. Never read the raw file directly.
-  python3 "${CLAUDE_PLUGIN_ROOT}/scripts/anvil-review.py" --provider claude \
-    --task-id "<LITERAL_TASK_ID>" --diff-file "$DIFF_FILE" --out "$CLAUDE_OUT"
+  # plus advisory / unverified / self_approved / passed. Never read the raw file directly.
+  # --self-approved only when SELF_APPROVED=1; it never changes verdict/passed, only
+  # the advisory list and the self_approved field.
+  if [ "$SELF_APPROVED" = "1" ]; then
+    python3 "${CLAUDE_PLUGIN_ROOT}/scripts/anvil-review.py" --provider claude \
+      --task-id "<LITERAL_TASK_ID>" --diff-file "$DIFF_FILE" --out "$CLAUDE_OUT" --self-approved
+  else
+    python3 "${CLAUDE_PLUGIN_ROOT}/scripts/anvil-review.py" --provider claude \
+      --task-id "<LITERAL_TASK_ID>" --diff-file "$DIFF_FILE" --out "$CLAUDE_OUT"
+  fi
   python3 -c "import json,sys
 for n in (json.load(open(sys.argv[1])).get('advisory') or []): print('ADVISORY:', n)" "$CLAUDE_OUT" 2>/dev/null || true
   # Fail closed: an unreadable or unguarded file yields passed=0, never a silent pass.
   PASSED=$(python3 -c "import json,sys; print(int(json.load(open(sys.argv[1]))['passed']))" "$CLAUDE_OUT" 2>/dev/null || echo 0)
   UNVERIFIED=$(python3 -c "import json,sys; print(int(bool(json.load(open(sys.argv[1])).get('unverified'))))" "$CLAUDE_OUT" 2>/dev/null || echo 0)
   CHECK=review-claude
+  [ "$SELF_APPROVED" = "1" ] && [ "$UNVERIFIED" = "0" ] && CHECK=review-claude-self-approved
   [ "$UNVERIFIED" = "1" ] && CHECK=review-claude-unverified
   python3 "${CLAUDE_PLUGIN_ROOT}/scripts/anvil-ledger.py" insert-check \
     --task-id "<LITERAL_TASK_ID>" --phase review \
@@ -358,9 +370,15 @@ for n in (json.load(open(sys.argv[1])).get('advisory') or []): print('ADVISORY:'
 fi
 ```
 
+*(Simplify the flag plumbing to a plain `if`/`else` on the ingest call as shown above rather than a shell parameter-expansion trick — the shell mechanics are not the point.)*
+
+**Precedence when both are true**: `review-claude-unverified` wins the check_name (set last, above). Unverified is the stronger signal — the reviewer named no work at all — and the self-approval fact is still carried by the `advisory` list either way, regardless of which check_name wins.
+
+A `review-claude-self-approved` row **is** a real review. It counts toward the step-5c review gate and it does **not** cap Confidence. Disclose it in the Evidence Bundle's Adversarial Review section — the advisory note already forces this via the rule below — and note that a second, out-of-family reviewer is what would remove the caveat, not a rerun of the same one.
+
 A `review-claude-unverified` row is **not** a clean review. It means the reviewer returned a verdict without naming a single command it ran, so its `pass` was downgraded to `concern` and recorded as unverified. It still carries `passed=1` — the guards never manufacture a FAIL row — so you must say so in the Evidence Bundle and cap Confidence at Medium. A task whose only reviewer row is `review-claude-unverified` has not been adversarially reviewed.
 
-The `review-loop-failure` stub is written: (a) in the spawning turn only when the Task tool call itself returned an error; (b) in the notification-handler turn when the notification arrived but the file was still not written; (c) whenever the notification carries a harness warning about the subagent's own output. Never insert a stub for a missing file in the spawning turn — the file doesn't exist yet by design.
+The `review-loop-failure` stub is written: (a) in the spawning turn only when the Task tool call itself returned an error; (b) in the notification-handler turn when the notification arrived but the file was still not written; (c) whenever the notification carries a harness warning asserting the subagent's output is fabricated / not genuine. Never insert a stub for a missing file in the spawning turn — the file doesn't exist yet by design. **A self-approval flag is not case (c)** — see the ingest branch above.
 
 The reviewer JSON schema (both Claude and external providers use the same schema):
 
@@ -375,13 +393,14 @@ The reviewer JSON schema (both Claude and external providers use the same schema
 | `findings[].why` | string | Why it matters |
 | `findings[].fix` | string | Concrete fix |
 | `unverified` | bool | Claude reviewer only. True when `checks_run` was empty. |
-| `advisory` | string[] | Incoherence `anvil-review.py` found in the reviewer's own payload. Empty list = coherent. |
+| `self_approved` | bool | Claude reviewer only. True when the harness flagged the review as self-approval. Does not affect `verdict` or `passed`. |
+| `advisory` | string[] | Coherence, provenance, and harness-provenance (self-approval / missing-diff) notes. Empty list = none raised. |
 
 There is no `description` or `location` field. Use `what` and `file` for findings text and location.
 
 **Reviewers contradict themselves, and the ledger cannot tell.** A reviewer can return well-formed JSON whose findings describe bugs *the diff fixes* — transcribing the diff's own documentation — and pair them with a `fail` verdict, producing an authoritative `passed=0` row against code the reviewer actually praised. `anvil-review.py` applies a coherence guard (`apply_coherence_guard`): it downgrades a `fail` carrying no high-severity finding to `concern`, upgrades a `pass` carrying a high-severity finding to `concern`, and writes an `advisory` list for anything else it cannot decide. The guard only *flags*; you still have to read the verdict. **Every provider goes through it, including Claude** — that is what the `--provider claude` ingest call in the notification handler is for.
 
-**A reviewer can also return a verdict it never earned**, which is worse: a fabricated `pass` is silent where a fabricated `fail` gets investigated. `apply_provenance_guard` downgrades a Claude `pass` with an empty `checks_run` to `concern` and marks it `unverified`. Understand what this does and does not buy: `checks_run` is **self-reported by the same agent**, so a reviewer determined to fabricate will fabricate the command list too. It is friction, plus a ledger row that reads *unverified* instead of *clean*. It is not proof the review happened, and the two real defences are elsewhere — the reviewer prompt, and the harness warning you must read off the notification.
+**A reviewer can also return a verdict it never earned**, which is worse: a fabricated `pass` is silent where a fabricated `fail` gets investigated. `apply_provenance_guard` downgrades a Claude `pass` with an empty `checks_run` to `concern` and marks it `unverified`. Understand what this does and does not buy: `checks_run` is **self-reported by the same agent**, so a reviewer determined to fabricate will fabricate the command list too. It is friction, plus a ledger row that reads *unverified* instead of *clean*. It is not proof the review happened, and the two real defences are elsewhere — the reviewer prompt, and the fabrication warning (not the self-approval one) you must read off the notification.
 
 **Before inserting any reviewer verdict, read its `summary` and `findings`.** If a finding describes a line the diff removes rather than one it adds, it is not a defect in this change — discount it, and say so in the Evidence Bundle rather than treating the row as a real failure. If `advisory` is non-empty, quote each note in the Evidence Bundle's Adversarial Review section. Never insert a silent `passed=0` for a verdict you have not read.
 

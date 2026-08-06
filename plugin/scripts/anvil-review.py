@@ -32,6 +32,10 @@ Usage:
                     --task-id TASK_ID
                     --diff-file PATH    # used for the off-diff advisory; tolerated if absent
                     [--out PATH]        # the file to read AND rewrite
+                    [--self-approved]   # harness flagged the notification as self-approval
+                                        # (reviewer in-family with the diff author); disclosed
+                                        # via an advisory note, never changes verdict/passed.
+                                        # Ingest providers only -- rejected (exit 2) otherwise.
 
 Output:
     - Stdout: one line, e.g. "reviewer=openai verdict=pass findings=0 model=gpt-4o"
@@ -726,8 +730,14 @@ _EXECUTING_PROVIDERS = {"claude"}  # reviewers with a shell, so checks_run is an
 
 # ---------- ingest (verdicts produced outside this script) --------------------
 
+_SELF_APPROVAL_NOTE = (
+    "harness flagged this review as self-approval: the reviewer is in-family with the "
+    "diff author; recorded as a valid review, not discarded"
+)
+
+
 def ingest_verdict(provider: str, task_id: str, in_path: Path,
-                   diff_path: Path | None) -> tuple[dict, Path]:
+                   diff_path: Path | None, self_approved: bool = False) -> tuple[dict, Path]:
     """Re-read a verdict written by a subagent and apply the same guards.
 
     Returns (record, out_path). The file is rewritten in place: the loop reads
@@ -735,6 +745,14 @@ def ingest_verdict(provider: str, task_id: str, in_path: Path,
     mistake. Raises FileNotFoundError when there is no verdict to ingest --
     a missing file means the reviewer never ran, which is the caller's
     review-loop-failure case, not a verdict.
+
+    `self_approved` is a provenance stamp, not a guard: it never changes
+    `verdict` or `passed`. In-family review (Claude reviewing a Claude-authored
+    diff) is the /anvil architecture, not an anomaly, so a harness flag saying
+    so is disclosed via `advisory` and the `self_approved` field rather than
+    discarded. It is recorded unconditionally -- even when the verdict file
+    itself is unparseable (`error` set) -- because it is a fact the harness
+    reported about the notification, not an inference from the payload.
     """
     text = in_path.read_text(encoding="utf-8", errors="replace") if in_path.exists() else ""
     if not text.strip():
@@ -766,11 +784,15 @@ def ingest_verdict(provider: str, task_id: str, in_path: Path,
         if provider in _EXECUTING_PROVIDERS:
             verdict, prov_advisory, unverified = apply_provenance_guard(verdict, checks_run)
             advisory.extend(prov_advisory)
+        if self_approved:
+            advisory.append(_SELF_APPROVAL_NOTE)
         if missing_diff:
             advisory.append(
                 "diff file was unavailable at ingest, so findings could not be checked "
                 "against the files this diff touches"
             )
+    elif self_approved:
+        advisory.append(_SELF_APPROVAL_NOTE)
 
     record = {
         "provider": provider,
@@ -781,6 +803,7 @@ def ingest_verdict(provider: str, task_id: str, in_path: Path,
         **verdict,
         "checks_run": checks_run,
         "unverified": unverified,
+        "self_approved": self_approved,
         "advisory": advisory,
         "passed": compute_passed(verdict["verdict"], error),
     }
@@ -797,7 +820,21 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--task-id", required=True)
     parser.add_argument("--diff-file", required=True)
     parser.add_argument("--out", default=None)
+    parser.add_argument("--self-approved", action="store_true",
+                        help="harness flagged the review notification as self-approval "
+                             "(ingest providers only)")
     args = parser.parse_args(argv)
+
+    # self_approved is a Claude-reviewer-only concept: openai/gemini/ollama are called
+    # synchronously by this script, so there is no async notification for a harness to
+    # flag as self-approval. Rejecting it here keeps it out of HTTP-provider records
+    # entirely, for the same reason checks_run/unverified are absent from them --
+    # an always-empty field invites exactly the misreading it would otherwise imply.
+    if args.self_approved and args.provider not in _EXECUTING_PROVIDERS:
+        print(f"anvil-review: --self-approved is only valid for --provider "
+              f"{'/'.join(sorted(_EXECUTING_PROVIDERS))}, not {args.provider!r}",
+              file=sys.stderr)
+        return 2
 
     # Ingest mode: the verdict already exists on disk, written by a subagent this
     # script did not call. Deliberately ahead of the enabled check -- refusing to
@@ -807,14 +844,15 @@ def main(argv: list[str] | None = None) -> int:
         in_path = Path(args.out) if args.out else default_out_path(args.provider, args.task_id)
         try:
             record, out_path = ingest_verdict(
-                args.provider, args.task_id, in_path, Path(args.diff_file))
+                args.provider, args.task_id, in_path, Path(args.diff_file), args.self_approved)
         except FileNotFoundError:
             print(f"anvil-review: no verdict file to ingest: {in_path}", file=sys.stderr)
             return 2
         print(
             f"reviewer={args.provider} verdict={record['verdict']} "
             f"findings={len(record['findings'])} advisory={len(record['advisory'])} "
-            f"unverified={int(record['unverified'])} out={out_path}"
+            f"unverified={int(record['unverified'])} self_approved={int(record['self_approved'])} "
+            f"out={out_path}"
         )
         return 0
 

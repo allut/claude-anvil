@@ -461,6 +461,7 @@ def test_checks_run_is_absent_from_http_provider_records(review):
     review.run()
     assert "checks_run" not in review.record()
     assert "unverified" not in review.record()
+    assert "self_approved" not in review.record()
 
 
 def test_ingest_survives_a_diff_path_that_is_a_directory(anvil_review, tmp_path):
@@ -475,4 +476,33 @@ def test_ingest_survives_a_diff_path_that_is_a_directory(anvil_review, tmp_path)
     assert rc == 0
     rec = json.loads(out.read_text(encoding="utf-8"))
     assert rec["verdict"] == "pass"
-    assert any("diff file was unavailable" in n for n in rec["advisory"])
+
+
+# --- --self-approved -----------------------------------------------------------
+
+def test_self_approved_flag_is_ingested_and_reported(anvil_review, tmp_path, capsys):
+    out = tmp_path / "verdict.json"
+    out.write_text(json.dumps({
+        "verdict": "pass", "summary": "clean", "checks_run": ["pytest"], "findings": [],
+    }), encoding="utf-8")
+    diff = tmp_path / "d.patch"
+    diff.write_text("diff --git a/x.py b/x.py\n", encoding="utf-8")
+    rc = anvil_review.main(["--provider", "claude", "--task-id", "t",
+                            "--diff-file", str(diff), "--out", str(out), "--self-approved"])
+    assert rc == 0
+    rec = json.loads(out.read_text(encoding="utf-8"))
+    assert rec["self_approved"] is True
+    assert any("self-approval" in n for n in rec["advisory"])
+    out_text = capsys.readouterr().out
+    assert "self_approved=1" in out_text
+
+
+def test_self_approved_rejected_for_http_providers(anvil_review, tmp_path, capsys):
+    diff = tmp_path / "d.patch"
+    diff.write_text("diff --git a/x.py b/x.py\n", encoding="utf-8")
+    out = tmp_path / "verdict.json"
+    rc = anvil_review.main(["--provider", "gemini", "--task-id", "t",
+                            "--diff-file", str(diff), "--out", str(out), "--self-approved"])
+    assert rc == 2
+    assert not out.exists()
+    assert "only valid for" in capsys.readouterr().err

@@ -2,6 +2,7 @@
 env parsing, path/diff helpers, model classification."""
 from __future__ import annotations
 
+import json
 import tempfile
 from pathlib import Path
 
@@ -521,6 +522,78 @@ def test_provenance_guard_does_not_mutate_its_input(anvil_review):
     v = {"verdict": "pass", "summary": "s", "findings": []}
     anvil_review.apply_provenance_guard(v, [])
     assert v["verdict"] == "pass"
+
+
+# --- ingest_verdict / self_approved --------------------------------------------
+#
+# self_approved is a provenance *stamp*, not a guard: it must never change
+# verdict or passed. These tests pin that invariant directly, plus the
+# unconditional-append placement (fires even when the verdict file is
+# unparseable) and the deterministic advisory ordering.
+
+def _write_verdict(tmp_path, payload):
+    out = tmp_path / "verdict.json"
+    out.write_text(json.dumps(payload), encoding="utf-8")
+    return out
+
+
+def test_self_approved_does_not_alter_verdict_or_passed(anvil_review, tmp_path):
+    payload = {"verdict": "pass", "summary": "clean", "checks_run": ["pytest"], "findings": []}
+    diff_path = tmp_path / "d.patch"
+    diff_path.write_text("diff --git a/x.py b/x.py\n", encoding="utf-8")
+    out_a = _write_verdict(tmp_path, payload)
+    rec_a, _ = anvil_review.ingest_verdict("claude", "t", out_a, diff_path, self_approved=False)
+    out_b = _write_verdict(tmp_path, payload)
+    rec_b, _ = anvil_review.ingest_verdict("claude", "t", out_b, diff_path, self_approved=True)
+
+    assert rec_a["verdict"] == rec_b["verdict"]
+    assert rec_a["passed"] == rec_b["passed"]
+    only_diff_keys = {k for k in rec_a if rec_a.get(k) != rec_b.get(k)}
+    assert only_diff_keys <= {"self_approved", "advisory"}
+    assert rec_b["self_approved"] is True
+    assert any("self-approval" in n for n in rec_b["advisory"])
+    assert rec_a["self_approved"] is False
+    assert not any("self-approval" in n for n in rec_a["advisory"])
+
+
+def test_self_approved_note_survives_an_unparseable_verdict(anvil_review, tmp_path):
+    out = tmp_path / "verdict.json"
+    out.write_text("not json at all", encoding="utf-8")
+    rec, _ = anvil_review.ingest_verdict("claude", "t", out, None, self_approved=True)
+    assert rec["error"]
+    assert any("self-approval" in n for n in rec["advisory"])
+
+
+def test_advisory_ordering_coherence_then_provenance_then_self_approval_then_missing_diff(
+    anvil_review, tmp_path
+):
+    out = tmp_path / "verdict.json"
+    out.write_text(json.dumps({
+        "verdict": "pass", "summary": "clean", "checks_run": [],
+        "findings": [{"severity": "critical", "file": "x.py"}],
+    }), encoding="utf-8")
+    rec, _ = anvil_review.ingest_verdict(
+        "claude", "t", out, tmp_path / "does-not-exist.patch", self_approved=True)
+    labels = []
+    for n in rec["advisory"]:
+        if "outside the high/medium/low" in n or "upgraded pass->concern" in n:
+            labels.append("coherence")
+        elif "unverified" in n:
+            labels.append("provenance")
+        elif "self-approval" in n:
+            labels.append("self_approval")
+        elif "diff file was unavailable" in n:
+            labels.append("missing_diff")
+    assert labels == ["coherence", "coherence", "provenance", "self_approval", "missing_diff"]
+
+
+def test_self_approved_defaults_to_false_with_no_note(anvil_review, tmp_path):
+    out = _write_verdict(tmp_path, {
+        "verdict": "pass", "summary": "s", "checks_run": ["pytest"], "findings": [],
+    })
+    rec, _ = anvil_review.ingest_verdict("claude", "t", out, None)
+    assert rec["self_approved"] is False
+    assert not any("self-approval" in n for n in rec["advisory"])
 
 
 # --- _normalize_path line suffixes ---------------------------------------------
