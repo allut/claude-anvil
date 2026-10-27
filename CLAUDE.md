@@ -40,11 +40,14 @@ plugin/
 - `~/.claude-anvil/config.json` — reviewer config; written by `anvil-config.py save`
 - `~/.claude-anvil/anvil.db` — SQLite ledger; override with `$ANVIL_DB_PATH`
 - `~/.claude-anvil/plugin-root` — junction/symlink created by `create-shortcuts`; points to the installed plugin directory
-- `~/.claude/commands/anvil.md` and `anvil-setup.md` — bare shortcuts written by `create-shortcuts`
+- `~/.claude/commands/anvil.md` and `anvil-setup.md` — bare shortcuts written by `create-shortcuts`; each carries a `<!-- claude-anvil-shortcut version=X -->` stamp after its frontmatter
+- `~/.claude/plugins/installed_plugins.json` (or `$CLAUDE_CONFIG_DIR/plugins/…`) — Claude Code's plugin registry; read-only reference for the installed version (`_installed_plugin()`)
 - `$ANVIL_TMPDIR/anvil-diff-<task_id>.patch` — staged diff snapshot used by reviewers (resolved via `python -c "import tempfile; print(tempfile.gettempdir())"` — on Windows this is `%LOCALAPPDATA%\Temp`, not MSYS2's `/tmp`)
 - `$ANVIL_TMPDIR/anvil-review-<provider>-<task_id>.json` — per-reviewer JSON verdicts (same temp dir)
 
-> **Note**: After editing any file under `plugin/commands/`, re-run `create-shortcuts` to sync the installed copies: `python plugin/scripts/anvil-config.py create-shortcuts` (resolves the installed `~/.claude-anvil/plugin-root` junction automatically). Stale shortcuts are the most common source of Windows `/tmp` path bugs.
+> **Note**: After editing any file under `plugin/commands/`, re-run `create-shortcuts` to sync the installed copies: `python plugin/scripts/anvil-config.py create-shortcuts` (resolves the `~/.claude-anvil/plugin-root` junction automatically; pass `plugin` explicitly if the junction does not point at the working tree). Stale shortcuts are the most common source of Windows `/tmp` path bugs.
+
+**The shortcut is a frozen copy and the installed plugin is the reference.** `/anvil` resolves to the user-command shortcut, so it and every script it calls through `plugin-root` stay on whatever release `create-shortcuts` last copied, while hooks run `${CLAUDE_PLUGIN_ROOT}` — the installed release. After an update the two drift (issue #4: hooks on 0.1.20, ledger on 0.1.19, so session scoping never applied). Two defences: `_resolve_plugin_root` replaces any candidate (argument or junction) whose `plugin.json` version provably *lags* the `installed_plugins.json` install with that install, and `status` writes `version-skew:` (these scripts lag) / `stale-shortcut:` (the shortcut's stamp lags or is missing) to stderr, each with a `Fix:` command. Only a provable lag counts: an unparseable version, or a working tree ahead of the release (the dev setup), is never "corrected" backwards. stdout of `status` stays one of three words.
 
 ## Key design invariants
 

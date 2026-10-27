@@ -34,7 +34,10 @@ workflow. The Python reviewer scripts call `get` to resolve credentials with
 that contract enforced in one place.
 
 Subcommands:
-    status                              -> prints "configured"/"partial"/"needs-setup"
+    status                              -> prints "configured"/"partial"/"needs-setup";
+                                           writes version-skew / stale-shortcut warnings to
+                                           stderr when this copy or the /anvil shortcut lags
+                                           the installed plugin (installed_plugins.json)
     path                                -> prints absolute config path
     read                                -> prints raw JSON (exit 1 if missing)
     get PROVIDER KEY [--env-var NAME]
@@ -56,7 +59,10 @@ Subcommands:
                                            with ${CLAUDE_PLUGIN_ROOT} replaced by a stable symlink;
                                            also creates ~/.claude-anvil/plugin-root junction/symlink.
                                            PLUGIN_ROOT optional: if omitted or invalid, falls back
-                                           to the installed ~/.claude-anvil/plugin-root junction
+                                           to the ~/.claude-anvil/plugin-root junction, then to the
+                                           installed plugin; a root older than the installed plugin
+                                           is replaced by it. Each shortcut is stamped with the
+                                           version it was generated from
 """
 from __future__ import annotations
 
@@ -614,6 +620,9 @@ VALIDATORS = {
 # --- subcommands -------------------------------------------------------------
 
 def cmd_status(_args: argparse.Namespace) -> int:
+    # stderr, so the stdout contract (one of three words) is unchanged for callers.
+    for warning in _stale_install_warnings():
+        print(f"anvil-config: {warning}", file=sys.stderr)
     cfg = load_config()
     if cfg is None:
         print("needs-setup")
@@ -1150,25 +1159,12 @@ def cmd_set_caveman(args: argparse.Namespace) -> int:
     return 0
 
 
-_CONTEXT7_TOOLS = {
-    "mcp__plugin_claude-anvil_context7__resolve-library-id",
-    "mcp__plugin_claude-anvil_context7__query-docs",
-}
+PLUGIN_NAME = "claude-anvil"
 
-# Matches the allowed-tools frontmatter line, e.g.:
-#   allowed-tools: Bash, Read, mcp__plugin_claude-anvil_context7__query-docs, Task
-_ALLOWED_TOOLS_RE = re.compile(r"^(allowed-tools:\s*)(.+)$", re.MULTILINE)
-
-
-def _strip_context7_tools(content: str) -> str:
-    def _replace(m: re.Match) -> str:
-        prefix = m.group(1)
-        tools = [t.strip() for t in m.group(2).split(",")]
-        filtered = [t for t in tools if t not in _CONTEXT7_TOOLS]
-        if not filtered:
-            return m.group(0)  # preserve original line rather than emit empty allowed-tools
-        return prefix + ", ".join(filtered)
-    return _ALLOWED_TOOLS_RE.sub(_replace, content)
+# Written into every generated shortcut, right after its frontmatter, so `status`
+# can tell a shortcut copied from an older release from a current one.
+_SHORTCUT_STAMP_RE = re.compile(r"^<!-- claude-anvil-shortcut version=(\S+) -->[ \t]*\r?$",
+                                re.MULTILINE)
 
 
 def _has_shortcut_sources(candidate: Path) -> bool:
@@ -1177,34 +1173,202 @@ def _has_shortcut_sources(candidate: Path) -> bool:
                for name in ("anvil.md", "anvil-setup.md"))
 
 
-def _resolve_plugin_root(arg: str | None, stable_link: Path) -> Path | None:
-    """Resolve the plugin root, falling back to the installed junction.
+def _plugin_version(root: Path) -> str | None:
+    """The version in <root>/.claude-plugin/plugin.json, or None if unreadable."""
+    try:
+        data = json.loads((root / ".claude-plugin" / "plugin.json").read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+    version = data.get("version") if isinstance(data, dict) else None
+    return version.strip() if isinstance(version, str) and version.strip() else None
 
-    Tries, in order:
+
+def _version_key(version: str | None) -> tuple[int, ...] | None:
+    """Dotted all-numeric versions only; anything else (a git sha, "1.0-rc1") is None.
+
+    isascii() too: str.isdigit() accepts superscripts like "²" that int() rejects.
+    """
+    parts = (version or "").split(".")
+    if not all(p.isascii() and p.isdigit() for p in parts):
+        return None
+    return tuple(int(p) for p in parts)
+
+
+def _version_lags(have: str | None, want: str | None) -> bool:
+    """True only when both versions parse and `have` is strictly older than `want`.
+
+    An unparseable version never counts as lagging: a working tree that is ahead
+    of the installed release (the dev setup) must not be "corrected" backwards.
+    """
+    a, b = _version_key(have), _version_key(want)
+    return a is not None and b is not None and a < b
+
+
+def _installed_plugins_path() -> Path:
+    base = os.environ.get("CLAUDE_CONFIG_DIR") or "~/.claude"
+    return Path(os.path.expanduser(base)) / "plugins" / "installed_plugins.json"
+
+
+def _installed_plugin() -> tuple[Path, str] | None:
+    """(installPath, version) of the newest claude-anvil in Claude Code's plugin registry.
+
+    This is the copy Claude Code itself runs -- hooks resolve ${CLAUDE_PLUGIN_ROOT}
+    to it -- so it is the reference a stale junction or shortcut is measured
+    against. The version comes from the install's own plugin.json (the same
+    source _plugin_version reads for every other root), falling back to the
+    registry's field. Returns None when the registry is absent or unreadable, or
+    lists no usable install.
+    """
+    try:
+        data = json.loads(_installed_plugins_path().read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+    plugins = data.get("plugins") if isinstance(data, dict) else None
+    if not isinstance(plugins, dict):
+        return None
+    best: tuple[Path, str, tuple[int, ...]] | None = None
+    for key, entries in plugins.items():
+        if not isinstance(key, str) or key.split("@", 1)[0] != PLUGIN_NAME:
+            continue
+        if not isinstance(entries, list):
+            continue
+        for entry in entries:
+            if not isinstance(entry, dict):
+                continue
+            path = entry.get("installPath")
+            if not isinstance(path, str) or not path.strip():
+                continue
+            root = Path(path)
+            if not _has_shortcut_sources(root):
+                continue
+            registry_version = entry.get("version")
+            version = _plugin_version(root) or (
+                registry_version if isinstance(registry_version, str) else None)
+            key_tuple = _version_key(version)
+            if version is None or key_tuple is None:
+                continue
+            if best is None or key_tuple > best[2]:
+                best = (root, version, key_tuple)
+    return (best[0], best[1]) if best else None
+
+
+def _resolve_plugin_root(arg: str | None, stable_link: Path) -> Path | None:
+    """Resolve the plugin root for create-shortcuts.
+
+    Picks a candidate, in order:
       1. The provided arg (if non-empty) -> Path(arg).resolve().
       2. The realpath of the existing plugin-root junction/symlink.
-    Returns the first candidate that actually contains the command sources, or
-    None if neither is valid. When a non-empty arg is invalid but the junction
-    fallback works, prints an informational note to stderr (don't silently mask
-    a wrong path).
+      3. The installPath of the installed plugin (installed_plugins.json).
+    A candidate from 1 or 2 whose plugin.json version provably lags the installed
+    version is replaced by the installed plugin, with a note on stderr: after a
+    plugin update the junction still points at the old cache dir, and falling
+    back to it re-pointed the junction at itself and froze the shortcuts on the
+    previous release. A candidate that is ahead of (or equal to) the installed
+    version -- a working tree in the dev setup -- is kept.
+
+    Returns None if no candidate contains the command sources. When a non-empty
+    arg is invalid but the junction fallback works, prints an informational note
+    to stderr (don't silently mask a wrong path).
     """
     arg_stripped = (arg or "").strip()
+    candidate: Path | None = None
     if arg_stripped:
-        candidate = Path(arg_stripped).resolve()
-        if _has_shortcut_sources(candidate):
-            return candidate
+        resolved = Path(arg_stripped).resolve()
+        if _has_shortcut_sources(resolved):
+            candidate = resolved
 
     # Fallback: the realpath of the existing junction, read while it still
     # points at the real target (resolution happens before we delete/recreate it).
-    if stable_link.exists() or stable_link.is_symlink():
+    if candidate is None and (stable_link.exists() or stable_link.is_symlink()):
         fallback = Path(os.path.realpath(stable_link))
         if _has_shortcut_sources(fallback):
             if arg_stripped:
                 print(f"anvil-config: '{arg_stripped}' is not a valid plugin root; "
                       f"falling back to installed junction {fallback}", file=sys.stderr)
-            return fallback
+            candidate = fallback
 
-    return None
+    installed = _installed_plugin()
+    if installed is None:
+        return candidate
+    installed_root, installed_version = installed
+    if candidate is None:
+        return installed_root
+    candidate_version = _plugin_version(candidate)
+    if _version_lags(candidate_version, installed_version):
+        print(f"anvil-config: {candidate} is claude-anvil {candidate_version}, but "
+              f"{installed_version} is installed; using the installed plugin "
+              f"{installed_root}", file=sys.stderr)
+        return installed_root
+    return candidate
+
+
+def _stamp_shortcut(content: str, version: str | None) -> str:
+    """Insert the version stamp after the frontmatter (or at the top if there is none)."""
+    stamp = f"<!-- claude-anvil-shortcut version={version or 'unknown'} -->\n"
+    if content.startswith("---"):
+        close = content.find("\n---", 3)
+        if close != -1:
+            eol = content.find("\n", close + 1)
+            if eol == -1:
+                return content + "\n" + stamp
+            return content[:eol + 1] + stamp + content[eol + 1:]
+    return stamp + content
+
+
+def _shortcut_version(content: str) -> str | None:
+    m = _SHORTCUT_STAMP_RE.search(content)
+    return m.group(1) if m else None
+
+
+def _stale_install_warnings() -> list[str]:
+    """Mixed-version checks for `status`, against the installed plugin.
+
+    - version-skew: these scripts are older than the installed plugin. Hooks run
+      the installed copy, so one /anvil loop would mix two releases.
+    - stale-shortcut: ~/.claude/commands/anvil.md was generated from an older
+      release (or before shortcuts carried a version stamp).
+    Each warning ends with the command that fixes it. Empty when the registry is
+    unreadable: no reference, no claim.
+
+    The fix runs the *installed* copy's create-shortcuts (it has the lag check
+    even when these scripts predate it) with no root argument, so resolution
+    picks the root: a lagging junction becomes the installed plugin, while a
+    junction at a working tree that is current (the dev setup) is kept.
+    Passing installPath explicitly would yank the dev junction off the tree.
+    """
+    installed = _installed_plugin()
+    if installed is None:
+        return []
+    installed_root, installed_version = installed
+    fix = (f'"{Path(sys.executable).as_posix()}" '
+           f'"{(installed_root / "scripts" / "anvil-config.py").as_posix()}" '
+           f'create-shortcuts')
+    warnings: list[str] = []
+
+    own_root = Path(__file__).resolve().parent.parent
+    own_version = _plugin_version(own_root)
+    if _version_lags(own_version, installed_version):
+        warnings.append(
+            f"version-skew: these scripts are claude-anvil {own_version} ({own_root}) "
+            f"but {installed_version} is installed and its hooks run that release. "
+            f"Fix: {fix}")
+
+    shortcut = Path(os.path.expanduser("~/.claude/commands")) / "anvil.md"
+    try:
+        text = shortcut.read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        text = None
+    if text is not None:
+        stamped = _shortcut_version(text)
+        if stamped is None:
+            warnings.append(
+                f"stale-shortcut: {shortcut} predates shortcut version stamps; "
+                f"installed is {installed_version}. Fix: {fix}")
+        elif _version_lags(stamped, installed_version):
+            warnings.append(
+                f"stale-shortcut: {shortcut} was generated from claude-anvil "
+                f"{stamped}; installed is {installed_version}. Fix: {fix}")
+    return warnings
 
 
 def cmd_create_shortcuts(args: argparse.Namespace) -> int:
@@ -1256,12 +1420,12 @@ def cmd_create_shortcuts(args: argparse.Namespace) -> int:
     # --- generate the two command files atomically ---
     commands_dir.mkdir(parents=True, exist_ok=True)
 
+    version = _plugin_version(plugin_root)
     created: list[str] = []
     for name, src in sources:
         content = src.read_text(encoding="utf-8")
         content = content.replace("${CLAUDE_PLUGIN_ROOT}", stable_link_str)
-        if name == "anvil.md":
-            content = _strip_context7_tools(content)
+        content = _stamp_shortcut(content, version)
         dest = commands_dir / name
         atomic_write(dest, content)
         created.append(str(dest))
@@ -1270,6 +1434,7 @@ def cmd_create_shortcuts(args: argparse.Namespace) -> int:
     for path in created:
         print(f"  {path}")
     print(f"Plugin-root link: {stable_link} -> {plugin_root}")
+    print(f"Version: {version or 'unknown'}")
     return 0
 
 
@@ -1342,8 +1507,9 @@ def build_parser() -> argparse.ArgumentParser:
     cs = sub.add_parser("create-shortcuts")
     cs.add_argument("plugin_root", metavar="PLUGIN_ROOT", nargs="?", default=None,
                     help="Absolute path to the plugin root (value of ${CLAUDE_PLUGIN_ROOT}). "
-                         "If omitted or invalid, falls back to the installed "
-                         "~/.claude-anvil/plugin-root junction.")
+                         "If omitted or invalid, falls back to the "
+                         "~/.claude-anvil/plugin-root junction, then to the installed "
+                         "plugin. A root older than the installed plugin is replaced by it.")
     cs.set_defaults(func=cmd_create_shortcuts)
 
     return p

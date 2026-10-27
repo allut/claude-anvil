@@ -363,33 +363,6 @@ def test_api_key_display_never_leaks_the_whole_key(anvil_config):
     assert "sk-supersecret" not in anvil_config._api_key_display("openai", "sk-supersecretXYZW")
 
 
-# --- _strip_context7_tools ----------------------------------------------------
-
-def test_strip_context7_tools_removes_only_the_context7_entries(anvil_config):
-    src = ("---\nallowed-tools: Bash, Read, "
-           "mcp__plugin_claude-anvil_context7__query-docs, "
-           "mcp__plugin_claude-anvil_context7__resolve-library-id, Task\n---\n")
-    out = anvil_config._strip_context7_tools(src)
-    assert "context7" not in out
-    assert "allowed-tools: Bash, Read, Task" in out
-
-
-def test_strip_context7_tools_preserves_a_line_that_would_become_empty(anvil_config):
-    src = "allowed-tools: mcp__plugin_claude-anvil_context7__query-docs\n"
-    assert anvil_config._strip_context7_tools(src) == src
-
-
-def test_strip_context7_tools_leaves_other_lines_alone(anvil_config):
-    src = "name: anvil\ndescription: mentions allowed-tools inline\n"
-    assert anvil_config._strip_context7_tools(src) == src
-
-
-def test_strip_context7_tools_handles_multiple_frontmatter_blocks(anvil_config):
-    src = "allowed-tools: Bash, mcp__plugin_claude-anvil_context7__query-docs\nx\nallowed-tools: Read\n"
-    out = anvil_config._strip_context7_tools(src)
-    assert out == "allowed-tools: Bash\nx\nallowed-tools: Read\n"
-
-
 # --- atomic_write -------------------------------------------------------------
 
 def test_atomic_write_creates_parents_and_writes_content(anvil_config, tmp_path):

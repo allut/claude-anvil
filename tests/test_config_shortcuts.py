@@ -7,6 +7,7 @@ worth exercising natively on each CI leg.
 """
 from __future__ import annotations
 
+import json
 import os
 import sys
 from pathlib import Path
@@ -124,13 +125,15 @@ def test_create_shortcuts_substitutes_the_plugin_root_placeholder(
     assert "\\" not in content.split("scripts/anvil-ledger.py")[0].split("python3 ")[-1]
 
 
-def test_create_shortcuts_strips_context7_from_anvil_md_only(
+def test_create_shortcuts_keeps_the_context7_tools(
         anvil_config, fake_plugin, home_paths):
+    """allowed-tools is copied verbatim: stripping the context7 tools only made
+    /anvil prompt for permission on every library-docs lookup."""
     _, commands_dir = home_paths
     anvil_config.main(["create-shortcuts", str(fake_plugin)])
-    assert "context7" not in (commands_dir / "anvil.md").read_text(encoding="utf-8")
-    # anvil-setup.md is untouched (its allowed-tools line would otherwise be emptied).
-    assert "context7" in (commands_dir / "anvil-setup.md").read_text(encoding="utf-8")
+    for name in ("anvil.md", "anvil-setup.md"):
+        assert "mcp__plugin_claude-anvil_context7__query-docs" in \
+            (commands_dir / name).read_text(encoding="utf-8")
 
 
 def test_create_shortcuts_is_repeatable(anvil_config, fake_plugin, home_paths):
@@ -191,8 +194,249 @@ def test_create_shortcuts_against_the_real_plugin_directory(anvil_config, home_p
     generated = (commands_dir / "anvil.md").read_text(encoding="utf-8")
     assert "${CLAUDE_PLUGIN_ROOT}" not in generated
     assert f"{stable_link.as_posix()}/scripts/anvil-ledger.py" in generated
-    # Only the allowed-tools frontmatter line is filtered; the prose that
-    # documents the Context7 tools is left as-is.
     allowed = [ln for ln in generated.splitlines() if ln.startswith("allowed-tools:")]
     assert allowed, "the shipped anvil.md has no allowed-tools frontmatter line"
-    assert all("context7" not in ln for ln in allowed)
+    assert any("context7" in ln for ln in allowed)
+    # The stamp lands after the frontmatter, so the frontmatter still opens the file.
+    assert generated.startswith("---")
+    shipped = anvil_config._plugin_version(REPO_ROOT / "plugin")
+    assert anvil_config._shortcut_version(generated) == shipped
+    head, _, _ = generated.partition(f"<!-- claude-anvil-shortcut version={shipped} -->")
+    assert head.count("\n---") == 1
+
+
+# --- version helpers ------------------------------------------------------------
+
+def _set_version(root: Path, version: str) -> None:
+    (root / ".claude-plugin").mkdir(parents=True, exist_ok=True)
+    (root / ".claude-plugin" / "plugin.json").write_text(
+        json.dumps({"name": "claude-anvil", "version": version}), encoding="utf-8")
+
+
+def _make_plugin(base: Path, version: str) -> Path:
+    root = base / version
+    (root / "commands").mkdir(parents=True)
+    for name in ("anvil.md", "anvil-setup.md"):
+        (root / "commands" / name).write_text(
+            f"---\nallowed-tools: Bash\n---\nrelease {version}\n", encoding="utf-8")
+    _set_version(root, version)
+    return root
+
+
+def _register(*entries: tuple[str, Path, str]) -> Path:
+    """Write ~/.claude/plugins/installed_plugins.json in the tmp HOME."""
+    plugins: dict = {}
+    for key, path, version in entries:
+        plugins.setdefault(key, []).append(
+            {"scope": "user", "installPath": str(path), "version": version})
+    reg = Path(os.path.expanduser("~/.claude/plugins/installed_plugins.json"))
+    reg.parent.mkdir(parents=True, exist_ok=True)
+    reg.write_text(json.dumps({"version": 2, "plugins": plugins}), encoding="utf-8")
+    return reg
+
+
+@pytest.mark.parametrize("have,want,lags", [
+    ("0.1.19", "0.1.20", True),
+    ("0.1.9", "0.1.10", True),      # numeric, not lexicographic
+    ("0.1.20", "0.1.20", False),
+    ("0.1.21", "0.1.20", False),    # dev working tree ahead of the release
+    ("0.2", "0.1.20", False),
+    ("abc123", "0.1.20", False),    # unparseable never counts as lagging
+    ("0.1.²", "0.1.20", False),  # isdigit() is true for "²", int() is not
+    (None, "0.1.20", False),
+    ("0.1.19", None, False),
+])
+def test_version_lags(anvil_config, have, want, lags):
+    assert anvil_config._version_lags(have, want) is lags
+
+
+def test_installed_plugin_picks_the_newest_claude_anvil(anvil_config, tmp_path):
+    old = _make_plugin(tmp_path / "cache", "0.1.19")
+    new = _make_plugin(tmp_path / "cache", "0.1.20")
+    other = _make_plugin(tmp_path / "other", "9.9.9")
+    _register(("claude-anvil@m", old, "0.1.19"), ("claude-anvil@m", new, "0.1.20"),
+              ("not-claude-anvil@m", other, "9.9.9"))
+    assert anvil_config._installed_plugin() == (new, "0.1.20")
+
+
+def test_installed_plugin_skips_unusable_entries(anvil_config, tmp_path):
+    gone = tmp_path / "cache" / "deleted"
+    _register(("claude-anvil@m", gone, "0.1.20"))
+    assert anvil_config._installed_plugin() is None
+
+
+@pytest.mark.parametrize("payload", ["not json", "[]", '{"plugins": []}',
+                                     '{"plugins": {"claude-anvil@m": "x"}}'])
+def test_installed_plugin_tolerates_a_malformed_registry(anvil_config, payload):
+    reg = _register()
+    reg.write_text(payload, encoding="utf-8")
+    assert anvil_config._installed_plugin() is None
+
+
+def test_installed_plugin_honours_claude_config_dir(anvil_config, tmp_path, monkeypatch):
+    new = _make_plugin(tmp_path / "cache", "0.1.20")
+    cfg_dir = tmp_path / "relocated"
+    monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(cfg_dir))
+    (cfg_dir / "plugins").mkdir(parents=True)
+    (cfg_dir / "plugins" / "installed_plugins.json").write_text(json.dumps(
+        {"plugins": {"claude-anvil@m": [{"installPath": str(new), "version": "0.1.20"}]}}),
+        encoding="utf-8")
+    assert anvil_config._installed_plugin() == (new, "0.1.20")
+
+
+# --- resolution against the installed plugin (issue #4) ------------------------
+
+def test_resolve_replaces_a_stale_junction_with_the_installed_plugin(
+        anvil_config, tmp_path, capsys):
+    old = _make_plugin(tmp_path / "cache", "0.1.19")
+    new = _make_plugin(tmp_path / "cache", "0.1.20")
+    _register(("claude-anvil@m", new, "0.1.20"))
+    link = tmp_path / "plugin-root"
+    _link(link, old)
+    assert anvil_config._resolve_plugin_root(None, link) == new
+    err = capsys.readouterr().err
+    assert "0.1.19" in err and "using the installed plugin" in err
+
+
+def test_resolve_replaces_a_stale_argument_too(anvil_config, tmp_path, capsys):
+    old = _make_plugin(tmp_path / "cache", "0.1.19")
+    new = _make_plugin(tmp_path / "cache", "0.1.20")
+    _register(("claude-anvil@m", new, "0.1.20"))
+    assert anvil_config._resolve_plugin_root(str(old), tmp_path / "nolink") == new
+    assert "using the installed plugin" in capsys.readouterr().err
+
+
+def test_resolve_keeps_a_root_ahead_of_the_installed_plugin(anvil_config, tmp_path, capsys):
+    """The dev setup: the junction points at a working tree that is ahead of
+    (or equal to) the installed release, and must stay there."""
+    installed = _make_plugin(tmp_path / "cache", "0.1.20")
+    tree = _make_plugin(tmp_path / "tree", "0.1.21")
+    _register(("claude-anvil@m", installed, "0.1.20"))
+    link = tmp_path / "plugin-root"
+    _link(link, tree)
+    assert anvil_config._resolve_plugin_root(None, link) == tree.resolve()
+    assert capsys.readouterr().err == ""
+
+
+def test_resolve_keeps_a_root_with_no_readable_version(anvil_config, fake_plugin, tmp_path):
+    installed = _make_plugin(tmp_path / "cache", "0.1.20")
+    _register(("claude-anvil@m", installed, "0.1.20"))
+    assert anvil_config._resolve_plugin_root(str(fake_plugin), tmp_path / "nolink") == \
+        fake_plugin.resolve()
+
+
+def test_resolve_falls_back_to_the_installed_plugin_without_a_link(anvil_config, tmp_path):
+    installed = _make_plugin(tmp_path / "cache", "0.1.20")
+    _register(("claude-anvil@m", installed, "0.1.20"))
+    assert anvil_config._resolve_plugin_root(None, tmp_path / "nolink") == installed
+
+
+def test_create_shortcuts_repoints_a_stale_link_at_the_installed_plugin(
+        anvil_config, tmp_path, home_paths, capsys):
+    """Issue #4's repro: update N -> N+1, run create-shortcuts with no root."""
+    stable_link, commands_dir = home_paths
+    old = _make_plugin(tmp_path / "cache", "0.1.19")
+    new = _make_plugin(tmp_path / "cache", "0.1.20")
+    assert anvil_config.main(["create-shortcuts", str(old)]) == 0
+    _register(("claude-anvil@m", new, "0.1.20"))
+    capsys.readouterr()
+
+    assert anvil_config.main(["create-shortcuts"]) == 0
+    assert Path(os.path.realpath(stable_link)) == new.resolve()
+    shortcut = (commands_dir / "anvil.md").read_text(encoding="utf-8")
+    assert "release 0.1.20" in shortcut
+    assert anvil_config._shortcut_version(shortcut) == "0.1.20"
+    assert "Version: 0.1.20" in capsys.readouterr().out
+
+
+# --- stamp ------------------------------------------------------------------------
+
+@pytest.mark.parametrize("content,expected", [
+    ("---\na: b\n---\nbody\n", "---\na: b\n---\n<!-- claude-anvil-shortcut version=1.2.3 -->\nbody\n"),
+    ("---\na: b\n---", "---\na: b\n---\n<!-- claude-anvil-shortcut version=1.2.3 -->\n"),
+    ("no frontmatter\n", "<!-- claude-anvil-shortcut version=1.2.3 -->\nno frontmatter\n"),
+])
+def test_stamp_shortcut(anvil_config, content, expected):
+    assert anvil_config._stamp_shortcut(content, "1.2.3") == expected
+    assert anvil_config._shortcut_version(expected) == "1.2.3"
+
+
+def test_stamp_reads_back_through_crlf(anvil_config):
+    stamped = anvil_config._stamp_shortcut("---\r\na: b\r\n---\r\nbody\r\n", "1.2.3")
+    assert anvil_config._shortcut_version(stamped) == "1.2.3"
+
+
+def test_stamp_without_a_version_is_unknown(anvil_config):
+    stamped = anvil_config._stamp_shortcut("x\n", None)
+    assert anvil_config._shortcut_version(stamped) == "unknown"
+
+
+# --- status warnings ------------------------------------------------------------
+
+def _status_err(anvil_config, capsys) -> tuple[str, str]:
+    capsys.readouterr()
+    assert anvil_config.main(["status"]) == 0
+    captured = capsys.readouterr()
+    return captured.out, captured.err
+
+
+def test_status_is_quiet_without_a_registry(anvil_config, capsys):
+    out, err = _status_err(anvil_config, capsys)
+    assert out.strip() == "needs-setup"
+    assert err == ""
+
+
+def test_status_warns_when_these_scripts_lag_the_installed_plugin(
+        anvil_config, tmp_path, capsys):
+    newer = _make_plugin(tmp_path / "cache", "999.0.0")
+    _register(("claude-anvil@m", newer, "999.0.0"))
+    out, err = _status_err(anvil_config, capsys)
+    assert out.strip() == "needs-setup"     # stdout contract unchanged
+    assert "anvil-config: version-skew:" in err
+    assert "999.0.0" in err
+    # No root argument: resolution decides (a lagging junction -> installed plugin,
+    # a current dev working tree -> kept).
+    assert err.rstrip().endswith(
+        f'"{(newer / "scripts" / "anvil-config.py").as_posix()}" create-shortcuts')
+
+
+def test_status_quiet_when_scripts_match_the_installed_plugin(
+        anvil_config, tmp_path, capsys):
+    shipped = anvil_config._plugin_version(REPO_ROOT / "plugin")
+    same = _make_plugin(tmp_path / "cache", shipped)
+    _register(("claude-anvil@m", same, shipped))
+    _, err = _status_err(anvil_config, capsys)
+    assert err == ""
+
+
+def test_status_flags_an_unstamped_shortcut(anvil_config, tmp_path, home_paths, capsys):
+    _, commands_dir = home_paths
+    shipped = anvil_config._plugin_version(REPO_ROOT / "plugin")
+    _register(("claude-anvil@m", _make_plugin(tmp_path / "cache", shipped), shipped))
+    commands_dir.mkdir(parents=True)
+    (commands_dir / "anvil.md").write_text("---\nx: y\n---\nold copy\n", encoding="utf-8")
+    _, err = _status_err(anvil_config, capsys)
+    assert "anvil-config: stale-shortcut:" in err
+    assert "predates shortcut version stamps" in err
+    assert "version-skew" not in err
+
+
+def test_status_flags_a_shortcut_from_an_older_release(
+        anvil_config, tmp_path, home_paths, capsys):
+    _, commands_dir = home_paths
+    old = _make_plugin(tmp_path / "cache", "0.0.1")
+    shipped = anvil_config._plugin_version(REPO_ROOT / "plugin")
+    assert anvil_config.main(["create-shortcuts", str(old)]) == 0
+    # The registry appears only after the shortcut was written from 0.0.1.
+    _register(("claude-anvil@m", _make_plugin(tmp_path / "cache", shipped), shipped))
+    _, err = _status_err(anvil_config, capsys)
+    assert "stale-shortcut:" in err and "0.0.1" in err
+
+
+def test_status_quiet_for_a_current_shortcut(anvil_config, tmp_path, home_paths, capsys):
+    shipped = anvil_config._plugin_version(REPO_ROOT / "plugin")
+    current = _make_plugin(tmp_path / "cache", shipped)
+    _register(("claude-anvil@m", current, shipped))
+    assert anvil_config.main(["create-shortcuts", str(current)]) == 0
+    _, err = _status_err(anvil_config, capsys)
+    assert err == ""

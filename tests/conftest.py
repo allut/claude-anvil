@@ -132,6 +132,8 @@ def isolate_env(tmp_path, monkeypatch):
     # ntpath.expanduser prefers USERPROFILE but falls back to HOMEDRIVE+HOMEPATH.
     monkeypatch.delenv("HOMEDRIVE", raising=False)
     monkeypatch.delenv("HOMEPATH", raising=False)
+    # Relocates ~/.claude (installed_plugins.json) away from the tmp HOME.
+    monkeypatch.delenv("CLAUDE_CONFIG_DIR", raising=False)
 
     monkeypatch.setenv("ANVIL_DB_PATH", str(tmp_path / "anvil.db"))
     monkeypatch.setenv("ANVIL_CONFIG_PATH", str(tmp_path / "config.json"))

@@ -120,6 +120,13 @@ Do NOT auto-invoke the wizard mid-task — the user already issued a task; ask t
 
 If it prints `partial`, surface a one-line note in the final summary ("⚠️ anvil config is partial; consider re-running `/anvil-setup`") but proceed.
 
+`status` also compares itself against the installed plugin and writes warnings to **stderr**:
+
+- `anvil-config: version-skew: …` — these scripts are older than the installed plugin, whose hooks run the newer release. One loop would mix two versions (ledger scoping, commit gate). Stop the loop and tell the user:
+  > 🔧 **Stale /anvil install.** The `/anvil` shortcut runs an older claude-anvil than the installed plugin. Run the `Fix:` command from the warning, then re-run `/anvil <your task>` in a new conversation.
+  Quote the `Fix:` command verbatim. Do not run it yourself: this conversation's command text is already the stale copy.
+- `anvil-config: stale-shortcut: …` alone — the `/anvil` shortcut file is older than the installed plugin, but the scripts running this loop are current. Proceed, and surface a one-line note with the `Fix:` command in the final summary.
+
 **Caveman check** (silent). After the `status` check, resolve the configured caveman output mode:
 
 ```bash
