@@ -92,7 +92,7 @@ def make_repo(path, files) -> Path:
     repo.mkdir(parents=True, exist_ok=True)
     git(repo, "init", "-q")
     for name, text in files.items():
-        (repo / name).write_text(text, encoding="utf-8", newline="\n")
+        (repo / name).write_bytes(text.encode("utf-8"))
     git(repo, "add", "-A")
     git(repo, "commit", "-q", "-m", "initial")
     return repo
