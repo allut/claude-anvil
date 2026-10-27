@@ -591,8 +591,8 @@ def test_insert_check_reports_the_stored_value_not_the_flag(tmp_path):
 def _staged_repo(tmp_path):
     repo = make_repo(tmp_path / "repo", {"a.txt": "alpha\n", "b.txt": "beta\n",
                                           "c.txt": "gamma\n"})
-    (repo / "a.txt").write_text("alpha changed\n", encoding="utf-8", newline="\n")
-    (repo / "d.txt").write_text("delta\n", encoding="utf-8", newline="\n")
+    (repo / "a.txt").write_bytes("alpha changed\n".encode("utf-8"))
+    (repo / "d.txt").write_bytes("delta\n".encode("utf-8"))
     git(repo, "rm", "-q", "b.txt")
     git(repo, "add", "a.txt", "d.txt")
     return repo

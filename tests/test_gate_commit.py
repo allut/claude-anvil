@@ -444,8 +444,8 @@ def test_commit_stages_worktree(anvil_gate, command, expected):
 def _repo_with_staged_batch(tmp_path):
     repo = make_repo(tmp_path / "repo", {"a.txt": "alpha\n", "b.txt": "beta\n",
                                           "c.txt": "gamma\n"})
-    (repo / "a.txt").write_text("alpha v2\n", encoding="utf-8", newline="\n")
-    (repo / "d.txt").write_text("delta\n", encoding="utf-8", newline="\n")
+    (repo / "a.txt").write_bytes("alpha v2\n".encode("utf-8"))
+    (repo / "d.txt").write_bytes("delta\n".encode("utf-8"))
     git(repo, "rm", "-q", "b.txt")
     git(repo, "add", "a.txt", "d.txt")
     return repo
@@ -528,11 +528,11 @@ def test_a_hunk_level_split_of_one_file_is_blocked(tmp_path):
     """The intermediate blob of a partially staged file was never reviewed."""
     db = _session_with(("baseline", "after", "review"), tmp_path)
     repo = make_repo(tmp_path / "repo", {"a.txt": "one\ntwo\n"})
-    (repo / "a.txt").write_text("one changed\ntwo changed\n", encoding="utf-8", newline="\n")
+    (repo / "a.txt").write_bytes("one changed\ntwo changed\n".encode("utf-8"))
     git(repo, "add", "a.txt")
     _snapshot(db, repo)
     _review_now(db)
-    (repo / "a.txt").write_text("one changed\ntwo\n", encoding="utf-8", newline="\n")
+    (repo / "a.txt").write_bytes("one changed\ntwo\n".encode("utf-8"))
     git(repo, "add", "a.txt")
     r = gate(db, repo_commit(repo))
     assert r.returncode == 2
