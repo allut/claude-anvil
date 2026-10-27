@@ -70,11 +70,42 @@ def query(db_path, sql, params=()):
         conn.close()
 
 
+# --- git ----------------------------------------------------------------------
+
+# isolate_env repoints HOME, so no global identity or signing config is visible.
+# Pin the few settings a commit needs, and the ones that would make blob hashes
+# depend on the developer's machine.
+_GIT_CONFIG = ("-c", "user.name=anvil-test", "-c", "user.email=anvil@test.invalid",
+               "-c", "commit.gpgsign=false", "-c", "core.autocrlf=false")
+
+
+def git(repo, *args) -> str:
+    r = subprocess.run(["git", *_GIT_CONFIG, *[str(a) for a in args]], cwd=str(repo),
+                       capture_output=True, text=True, timeout=60)
+    assert r.returncode == 0, f"git {' '.join(map(str, args))} failed:\n{r.stderr}"
+    return r.stdout
+
+
+def make_repo(path, files) -> Path:
+    """``git init`` at ``path`` with ``files`` ({name: text}) as one commit."""
+    repo = Path(path)
+    repo.mkdir(parents=True, exist_ok=True)
+    git(repo, "init", "-q")
+    for name, text in files.items():
+        (repo / name).write_text(text, encoding="utf-8", newline="\n")
+    git(repo, "add", "-A")
+    git(repo, "commit", "-q", "-m", "initial")
+    return repo
+
+
 # --- hook payloads ------------------------------------------------------------
 
-def hook_payload(tool_name, **tool_input) -> str:
+def hook_payload(tool_name, cwd=None, **tool_input) -> str:
     """Serialize a Claude Code hook-input blob for the two hook scripts."""
-    return json.dumps({"tool_name": tool_name, "tool_input": tool_input})
+    data = {"tool_name": tool_name, "tool_input": tool_input}
+    if cwd is not None:
+        data["cwd"] = str(cwd)
+    return json.dumps(data)
 
 
 # --- fake HTTP ----------------------------------------------------------------

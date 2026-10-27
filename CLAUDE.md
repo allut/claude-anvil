@@ -21,7 +21,7 @@ plugin/
   agents/
     code-review-claude.md      # subagent definition for the Claude adversarial reviewer
   scripts/
-    anvil_shared.py            # shared helpers (e.g. db_path) imported by ledger + hook scripts
+    anvil_shared.py            # shared helpers (db_path, staged-index manifest) imported by ledger + hook scripts
     anvil-config.py            # owns ~/.claude-anvil/config.json; all config I/O
     anvil-ledger.py            # SQLite ledger + session memory CLI
     anvil-review.py            # dispatches review calls to OpenAI/Gemini/Ollama
@@ -29,7 +29,7 @@ plugin/
     anvil-track-edit.py        # PostToolUse hook: records every Edit/Write/MultiEdit
     fix-windows-plugin.ps1/.bat  # one-time Windows plugin setup helpers
   sql/
-    schema.sql                 # idempotent DDL; applied via `anvil-ledger.py init`
+    schema.sql                 # idempotent DDL; applied on every ledger connection
   hooks/hooks.json             # hook wiring (PreToolUse Bash → gate-commit, PostToolUse Edit|Write|MultiEdit → track-edit)
   .mcp.json                    # MCP server: context7 (library docs)
   .env.example                 # env var reference for all ANVIL_* overrides
@@ -50,7 +50,9 @@ plugin/
 
 **anvil-config.py is the single owner of config.json.** Never write to it directly. Use the `save`, `set`, `enable`, `disable`, `set-caveman`, or `gui-key` subcommands. `enable`/`disable PROVIDER` flip `reviewers.<name>.enabled` and sync roster membership without touching `api_key`/`endpoint`/`model` — that is the supported way to turn a reviewer off without re-running the setup wizard or re-entering credentials. The schema carries a top-level `caveman` block (`{"enabled": false, "level": "full"}`) alongside `reviewers` and `roster`; `set-caveman LEVEL|off` is the only writer for it and `caveman` resolves the active level (env → config → `off`). The `caveman` skill itself is an optional external dependency (not bundled with claude-anvil, lives at `~/.claude/skills/caveman/`); when it's absent `/anvil` degrades to normal prose regardless of the configured level.
 
-**anvil-ledger.py is the single owner of the SQLite DB.** Never shell out to raw `sqlite3`. All SQL goes through the ledger CLI.
+**anvil-ledger.py is the single owner of the SQLite DB.** Never shell out to raw `sqlite3`. All SQL goes through the ledger CLI. `connect()` applies the idempotent schema on every open (there is no versioning), so an existing DB gains new tables on first use.
+
+**Ledger reads are scoped to the task's newest session.** `count-phase` and `select-bundle` add `ts >= created_at` of the newest `sessions` row for the `task_id` (`_session_floor`, the same bound the gate uses); a task with no session reads every row. Without this a reused `task_id` showed stale rows in the bundle and let old evidence pass the 5c/5e gates. `select-bundle --all-sessions` is the unscoped history view; `start-session` warns on stderr when the `task_id` already has sessions, and the loop suffixes task ids with `-YYYYMMDD`. `insert-check` prints `ok` only when the *stored* `passed` is 1, else `FAIL <check>: <first output line>` — exit code stays 0 so `&&` chains keep running.
 
 **API keys never appear in argv, shell args, or tool results.** On Windows they are DPAPI-encrypted and stored in config.json with a `dpapi:` prefix. On macOS/Linux they go to the OS keychain. `gui-key` collects them via a Tkinter password dialog.
 
@@ -104,8 +106,59 @@ Three properties remain load-bearing and have named tests:
 Accepted over-blocks (pinned by tests): `git status > commit`, `git log --grep commit`,
 `git -C commit status`. Accepted under-blocks: user-defined git aliases (`git ci`) and
 shell functions — detecting those means running `git config` from inside a PreToolUse
-hook on every Bash call. The gate is an evidence-discipline aid, not a security
+hook on every Bash call. Pathspec commits (`git commit -- path`, `-o`/`--only`,
+`-i`/`--include`) are also an accepted under-block: they stage at commit time like `-a`,
+but telling a pathspec from a message or option value is exactly the grammar modelling
+ruled out above. The gate is an evidence-discipline aid, not a security
 boundary; it is fail-open by design (see the module docstring).
+
+**The gate binds a commit to the diff the reviewers saw.** Counts alone let any commit
+through once each phase had one row — every commit after the first review passed
+with no review of its content. Step 5c now runs `anvil-ledger.py snapshot-diff`, which
+writes the reviewers' patch and stores a `review_snapshots` row: a manifest of
+`{path, status, dst_mode, dst_sha}` from `git diff --cached --no-renames --raw
+--no-abbrev -z` (`anvil_shared.STAGED_RAW_ARGS`; the ledger and the gate must run the
+identical command, so it lives in one place). When the session has a snapshot, after
+the count check passes:
+- **Review after snapshot.** At least one `review` row (other than
+  `reviewer-unavailable`) must have an `id` above the snapshot's `checks_high_water`
+  (`MAX(anvil_checks.id)`, read inside the snapshot's own INSERT), or the commit is
+  blocked. Never order this by `ts`: timestamps are 1-second `CURRENT_TIMESTAMP`s, and a
+  previous round's review in the same second as a re-snapshot passed for a fresh one —
+  caught by adversarial review as a flaky test. (The session floor is still `ts`-based;
+  a reused task's old rows are minutes-to-months older, not sub-second.)
+- **Subset rule.** Every staged entry must equal the snapshot's entry for that path on
+  `(status, dst_mode, dst_sha)`. A path subset is allowed (review one batch, commit it
+  as several commits); new content, a file outside the snapshot, and a hunk-level split
+  of one file (its intermediate blob was never reviewed) are blocked, naming the first 5
+  paths.
+- **`-a` / `--all` / any short-flag cluster containing `a`** on the gated segment is
+  blocked: those stage at commit time, so the index the gate read is not what would be
+  committed. `_scan` returns the gated segments themselves so this reuses the same
+  token walk — no regex. A cluster with an attached value (`-mamend`) over-blocks.
+- **The commit must be the only git invocation on its line.** The hook reads the index
+  *before* the Bash line runs, so `git add x && git commit -m y` committed `x` unseen
+  (adversarial review, round 2). `_scan` takes a segment predicate; with
+  `_segment_runs_git` it counts every git segment, wrappers included, and more than one
+  blocks. Blunt on purpose: `git status && git commit` over-blocks rather than the gate
+  learning which git subcommands touch the index. Accepted under-blocks: non-git
+  commands that rewrite the index (a script calling `git add`), and git run inside a
+  *quoted* command substitution on the commit line (`git commit -m "x $(git add y)"`) —
+  shlex keeps the quoted string as one token. Rescanning substitutions is the grammar
+  modelling ruled out above; blocking every `$(` would refuse the standard
+  `-m "$(cat <<'EOF' …)"` message form. Both are deliberate evasion, not the accidental
+  `git add && git commit` this rule exists for.
+
+`snapshot-diff` truncates `--out` before running git (a failure can never leave a stale
+patch to review) and reads the manifest on both sides of the patch; if the index changed
+in between it records nothing and exits 1.
+
+Failure handling keeps the stances separate. The snapshot read has its own `try`:
+`no such table` (a DB older than the table — the gate's raw connection never applies
+the schema) or no row means count-only, as before. It must never reach `main()`'s
+broad `except sqlite3.Error: return 0`, or an old DB would fail open on missing
+evidence. If git cannot read the index in the payload's `cwd`, the gate writes a stderr
+note and falls back to count-only — the documented fail-open stance.
 
 
 ## Reviewer architecture

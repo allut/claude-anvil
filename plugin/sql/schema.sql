@@ -1,6 +1,7 @@
 -- claude-anvil verification ledger + session memory
 -- Location: $ANVIL_DB_PATH (default ~/.claude-anvil/anvil.db)
--- All DDL is idempotent; `anvil-ledger.sh init` runs this on first use and on upgrades.
+-- All DDL is idempotent; anvil-ledger.py applies it on every connection, so an existing
+-- DB picks up new tables on first use after an upgrade.
 
 PRAGMA journal_mode = WAL;
 PRAGMA foreign_keys = ON;
@@ -53,6 +54,23 @@ CREATE VIRTUAL TABLE IF NOT EXISTS search_index USING fts5(
     session_id UNINDEXED,
     source_type UNINDEXED
 );
+
+-- One row per `anvil-ledger.py snapshot-diff`: the staged index the reviewers were shown.
+-- The commit gate only lets a commit through while every staged entry still matches the
+-- newest snapshot of the session on (status, dst_mode, dst_sha).
+-- checks_high_water is MAX(anvil_checks.id) when the snapshot was taken: a review counts as
+-- "after" the snapshot only when its id is greater. Timestamps have 1-second resolution, so a
+-- stale review in the same second as a re-snapshot would otherwise pass for a fresh one.
+CREATE TABLE IF NOT EXISTS review_snapshots (
+    id                INTEGER PRIMARY KEY AUTOINCREMENT,
+    session_id        INTEGER REFERENCES sessions(id),
+    task_id           TEXT NOT NULL,
+    patch_sha256      TEXT NOT NULL,
+    manifest          TEXT NOT NULL,     -- JSON: [{path, status, dst_mode, dst_sha}]
+    checks_high_water INTEGER NOT NULL DEFAULT 0,
+    created_at        DATETIME DEFAULT CURRENT_TIMESTAMP
+);
+CREATE INDEX IF NOT EXISTS ix_review_snapshots_session ON review_snapshots(session_id);
 
 -- Key/value store for facts the agent learns (build commands, codebase conventions, etc.)
 CREATE TABLE IF NOT EXISTS memory (

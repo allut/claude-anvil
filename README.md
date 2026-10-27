@@ -100,7 +100,7 @@ python scripts/anvil-config.py enable  openai   # back on, same key/endpoint/mod
 - **OpenRouter / Groq**: `HTTP-Referer` and `X-Title` attribution headers are sent unconditionally. If a free-tier model rejects `response_format: {type: json_object}`, the wizard's "JSON mode = off" toggle (or `ANVIL_OPENAI_JSON_MODE=off`) makes anvil fall back to extracting JSON from the reply body.
 - **Slow or queued endpoints**: every reviewer HTTP call is bounded by two true wall-clock deadlines — `ANVIL_REVIEW_HTTP_TIMEOUT` per attempt (default `180`s) and `ANVIL_REVIEW_TOTAL_TIMEOUT` for the whole call including retries (default `420`s). A provider that stalls mid-response yields a graceful stub verdict instead of hanging the loop.
 
-A commit gate blocks `git commit` during an active `/anvil` session when the ledger is missing evidence in any of the three phases (baseline, after, review). Commits outside an anvil session are unaffected.
+A commit gate blocks `git commit` during an active `/anvil` session when the ledger is missing evidence in any of the three phases (baseline, after, review). It also requires the staged content to match the snapshot the reviewers saw (`anvil-ledger.py snapshot-diff`, step 5c): a file edited after review, or one outside the snapshot, blocks the commit until it is re-reviewed, and `git commit -a` (or staging and committing in one command line) is refused while a snapshot exists. Committing a reviewed batch as several commits, staged by path, is fine. Commits outside an anvil session are unaffected.
 
 ### Caveman output mode (optional)
 

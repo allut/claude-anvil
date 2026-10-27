@@ -18,7 +18,7 @@ The user's request is:
 
 This plugin ships a SQLite verification ledger and a few helper scripts. You interact with them through Bash:
 
-- **Ledger + session memory + learnable facts**: `python3 "${CLAUDE_PLUGIN_ROOT}/scripts/anvil-ledger.py" <subcommand>` (subcommands: `init`, `insert-check`, `select-bundle`, `count-phase`, `start-session`, `end-session`, `track-edit`, `recall`, `recall-issues`, `memory-set`, `memory-get`, `memory-list`).
+- **Ledger + session memory + learnable facts**: `python3 "${CLAUDE_PLUGIN_ROOT}/scripts/anvil-ledger.py" <subcommand>` (subcommands: `init`, `insert-check`, `select-bundle`, `count-phase`, `start-session`, `end-session`, `track-edit`, `recall`, `recall-issues`, `memory-set`, `memory-get`, `memory-list`, `snapshot-diff`). `insert-check` prints `ok` for a passing row and `FAIL <check>: <first output line>` for a failing one — a `FAIL` line means the check failed: stop and fix before moving on.
 - **External adversarial reviewers** (GPT, Gemini, Ollama): `python3 "${CLAUDE_PLUGIN_ROOT}/scripts/anvil-review.py" --provider openai|gemini|ollama --task-id TASK_ID --diff-file "$ANVIL_TMPDIR/anvil-diff-TASK_ID.patch"`. Writes a JSON verdict you then read and INSERT into the ledger.
 - **Claude adversarial reviewer**: invoke `Task(subagent_type="claude-anvil:code-review-claude", ...)` (see 5c below).
 - **IDE diagnostics**: call `mcp__ide__getDiagnostics` directly.
@@ -68,7 +68,7 @@ If unsure, treat as Medium.
 All verification is recorded in SQL. This prevents hallucinated verification.
 The DB lives at `$ANVIL_DB_PATH` (default `~/.claude-anvil/anvil.db`). All SQL goes through `anvil-ledger.py` — do NOT shell out to raw `sqlite3` and do NOT create project-local DB files.
 
-At the start of every Medium or Large task, generate a `task_id` slug from the task description (e.g., `fix-login-crash`, `add-user-avatar`). Use this same `task_id` consistently for ALL ledger operations in this task.
+At the start of every Medium or Large task, generate a `task_id` slug from the task description plus today's date, `<slug>-<YYYYMMDD>` (e.g., `fix-login-crash-20260301`, `add-user-avatar-20260301`), so a later task with the same name gets its own slug. Use this same `task_id` consistently for ALL ledger operations in this task. `count-phase` and `select-bundle` only read checks recorded since the task's newest session; if `start-session` warns that the `task_id` was reused, earlier runs' rows no longer count (`select-bundle --all-sessions` still shows them).
 
 The `anvil_checks` table schema (reference only — do not re-create it):
 
@@ -95,6 +95,8 @@ python3 "${CLAUDE_PLUGIN_ROOT}/scripts/anvil-ledger.py" insert-check \
   --check "<name>" --tool "<tool>" --command "<command>" \
   --exit-code <n> --passed 0|1 --output-file "$ANVIL_TMPDIR/<output>"
 ```
+
+It prints `ok`, or `FAIL <check>: <first output line>` when the stored row has `passed=0` (including a pass forced to 0 because the output file was missing). A `FAIL` line means the check failed — stop and fix it before moving on.
 
 **Rule: Every verification step must be an INSERT. The Evidence Bundle is the output of `select-bundle`, not prose. If the INSERT didn't happen, the verification didn't happen.**
 
@@ -278,13 +280,12 @@ ANVIL_TMPDIR=$(python3 -c "import tempfile; print(tempfile.gettempdir())") # nat
 DIFF_FILE="$ANVIL_TMPDIR/anvil-diff-$TASK_ID.patch"
 CLAUDE_OUT="$ANVIL_TMPDIR/anvil-review-claude-$TASK_ID.json"
 git add -A
-git --no-pager diff --staged > "$DIFF_FILE"
-# Verify the diff file has content — existence alone doesn't mean anything was staged
-[ -s "$DIFF_FILE" ] || { echo "ERROR: diff file is empty — nothing staged"; exit 1; }
-ls -la "$DIFF_FILE"
+# Writes the staged patch to $DIFF_FILE and records its manifest; exits 1 with
+# "ERROR: nothing staged" on an empty index.
+python3 "${CLAUDE_PLUGIN_ROOT}/scripts/anvil-ledger.py" snapshot-diff --task-id "$TASK_ID" --out "$DIFF_FILE" || exit 1
 ```
 
-**🚫 Do NOT proceed if the content check fails.** An empty diff means nothing was staged; all reviewers would return trivially clean verdicts. The diff file path comes from `$ANVIL_TMPDIR`, which on macOS is `/var/folders/…/T`, not `/tmp/`. Never hardcode `/tmp/` in reviewer prompts.
+**🚫 Do NOT proceed if `snapshot-diff` fails.** An empty diff means nothing was staged; all reviewers would return trivially clean verdicts. The snapshot is also what the commit gate checks in Step 8: a commit is allowed only while every staged file matches the snapshot reviewed after it. Any content change after review — a fix for a reviewer finding included — needs a new `snapshot-diff` and a new review round before it can be committed. The diff file path comes from `$ANVIL_TMPDIR`, which on macOS is `/var/folders/…/T`, not `/tmp/`. Never hardcode `/tmp/` in reviewer prompts.
 
 **All variable assignments (`ANVIL_TMPDIR`, `DIFF_FILE`, `CLAUDE_OUT`) and the external reviewer Bash calls that reference them must be in a single Bash tool invocation.** Each Bash call runs in a fresh shell — variables set in one call are gone in the next. Either batch everything into one call, or re-resolve and echo the paths at the start of each subsequent call before using them.
 
@@ -621,10 +622,10 @@ For Small tasks: show the change, confirm build passed, done. Run Learn step for
 After presenting, automatically commit the changes. The user should never have to remember to do this.
 
 1. Capture the pre-commit SHA: `PRE_SHA=$(git rev-parse HEAD)`.
-2. Stage all changes: `git add -A`.
+2. Do **not** re-run `git add -A`: commit exactly the index that `snapshot-diff` captured in 5c. Re-staging here would sweep post-review edits into the commit unreviewed, and the commit gate blocks any staged file that differs from the reviewed snapshot. Never use `git commit -a`/`--all` either — the gate refuses it while a snapshot exists. Run `git commit` as its own Bash call: the gate also refuses a commit line that contains any other git command (`git add … && git commit …`), because it checks the index before the line runs.
 3. Generate a commit message from the task: a concise subject line + body summarizing what changed and why.
 4. Include the `Co-Authored-By: Claude <noreply@anthropic.com>` trailer.
-5. Commit: `git commit -m "..."`.
+5. Commit: `git commit -m "..."`. Committing the reviewed work as several commits is fine — stage by path (`git reset -- <paths>` the rest, commit, then `git add <paths>` the next group). Any content change after review needs a new snapshot and review.
 6. Close the anvil session so the PostToolUse hook stops attaching edits to this task:
    ```bash
    python3 "${CLAUDE_PLUGIN_ROOT}/scripts/anvil-ledger.py" end-session "$ANVIL_SESSION_ID" "<one-sentence recap of what changed>"

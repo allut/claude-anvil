@@ -4,15 +4,18 @@
 The /anvil loop invokes this for every ledger operation. Uses Python's stdlib
 sqlite3 -- no external dependencies, works the same on Windows/macOS/Linux.
 
-Schema lives in ../sql/schema.sql and is (re-)applied on every `init` call so
-upgrades pick up new tables automatically.
+Schema lives in ../sql/schema.sql and is (re-)applied on every connection
+(idempotent DDL), so an existing DB picks up new tables on first use.
+
+count-phase and select-bundle read only checks recorded since the newest
+session of the task, so a reused task_id cannot satisfy a gate with stale rows.
 
 CLI summary:
     anvil-ledger.py init
     anvil-ledger.py insert-check --task-id ID --phase PHASE --check NAME
                                  --tool TOOL [--command CMD] [--exit-code N]
                                  --passed 0|1 [--output STR | --output-file PATH]
-    anvil-ledger.py select-bundle TASK_ID
+    anvil-ledger.py select-bundle TASK_ID [--all-sessions]
     anvil-ledger.py count-phase TASK_ID PHASE
     anvil-ledger.py start-session TASK_ID [REPO_PATH] [BRANCH]  -> prints session_id
     anvil-ledger.py end-session SESSION_ID SUMMARY
@@ -22,6 +25,7 @@ CLI summary:
     anvil-ledger.py memory-set KEY VALUE
     anvil-ledger.py memory-get KEY
     anvil-ledger.py memory-list
+    anvil-ledger.py snapshot-diff --task-id ID --out FILE    (run inside the repo)
 """
 from __future__ import annotations
 
@@ -30,8 +34,11 @@ import sys
 sys.stdout.reconfigure(encoding="utf-8", errors="replace")  # type: ignore[union-attr]
 
 import argparse
+import hashlib
+import json
 import os
 import sqlite3
+import subprocess
 import sys
 import textwrap
 from pathlib import Path
@@ -43,17 +50,22 @@ SCHEMA_PATH = REPO_DIR / "sql" / "schema.sql"
 SNIPPET_MAX = 4000
 
 sys.path.insert(0, str(SCRIPT_DIR))
-from anvil_shared import db_path  # noqa: E402
+from anvil_shared import GitError, db_path, run_git, staged_manifest  # noqa: E402
+
+# The patch the reviewers read. Same index as anvil_shared.STAGED_RAW_ARGS; color and
+# external diff drivers off so a user's git config cannot change what is reviewed.
+PATCH_ARGS = ("diff", "--cached", "--no-renames", "--no-color", "--no-ext-diff")
+FAIL_LINE_MAX = 200
 
 
 def connect() -> sqlite3.Connection:
     path = db_path()
     path.parent.mkdir(parents=True, exist_ok=True)
-    fresh = not path.exists()
     conn = sqlite3.connect(str(path))
     conn.execute("PRAGMA foreign_keys = ON;")
-    if fresh:
-        apply_schema(conn)
+    # Always: the DDL is idempotent and there is no schema versioning, so this is
+    # how a DB created by an older release gains tables added since.
+    apply_schema(conn)
     return conn
 
 
@@ -61,11 +73,37 @@ def apply_schema(conn: sqlite3.Connection) -> None:
     if not SCHEMA_PATH.exists():
         sys.exit(f"anvil-ledger: schema missing at {SCHEMA_PATH}")
     conn.executescript(SCHEMA_PATH.read_text(encoding="utf-8"))
+    # CREATE TABLE IF NOT EXISTS never alters an existing table. review_snapshots
+    # was briefly created without checks_high_water by pre-release builds.
+    cols = {row[1] for row in conn.execute("PRAGMA table_info(review_snapshots)")}
+    if "checks_high_water" not in cols:
+        conn.execute("ALTER TABLE review_snapshots "
+                     "ADD COLUMN checks_high_water INTEGER NOT NULL DEFAULT 0")
     conn.commit()
 
 
 def clip(text: str, n: int = SNIPPET_MAX) -> str:
     return text if len(text) <= n else text[:n]
+
+
+def _newest_session(conn: sqlite3.Connection, task_id: str):
+    """(id, created_at) of the task's newest session, or None."""
+    return conn.execute(
+        "SELECT id, created_at FROM sessions WHERE task_id = ? ORDER BY id DESC LIMIT 1",
+        (task_id,),
+    ).fetchone()
+
+
+def _session_floor(conn: sqlite3.Connection, task_id: str):
+    """created_at of the task's newest session, or None for a task with no session.
+
+    The same bound the commit gate applies (`ts >= sessions.created_at`): a check
+    recorded before the newest session belongs to an earlier run of a reused
+    task_id and must not count. None keeps the old flow (no start-session) reading
+    every row.
+    """
+    row = _newest_session(conn, task_id)
+    return row[1] if row else None
 
 
 def print_table(rows: list[sqlite3.Row], headers: list[str]) -> None:
@@ -87,8 +125,7 @@ def print_table(rows: list[sqlite3.Row], headers: list[str]) -> None:
 # --- commands -----------------------------------------------------------------
 
 def cmd_init(_args: argparse.Namespace) -> None:
-    conn = connect()
-    apply_schema(conn)
+    connect()  # applies the schema
     print(f"anvil ledger ready at {db_path()}")
 
 
@@ -128,47 +165,78 @@ def cmd_insert_check(args: argparse.Namespace) -> None:
     )
     # Feed review-phase findings into the FTS index so recall-issues can surface them.
     if args.phase == "review" and output:
-        row = conn.execute(
-            "SELECT id FROM sessions WHERE task_id = ? ORDER BY id DESC LIMIT 1",
-            (args.task_id,),
-        ).fetchone()
+        row = _newest_session(conn, args.task_id)
         if row:
             conn.execute(
                 "INSERT INTO search_index (content, session_id, source_type) VALUES (?, ?, 'review')",
                 (clip(output, 500), row[0]),
             )
     conn.commit()
-    print("ok")
+    # Report what was stored, not what was asked for: a missing output file has
+    # already forced passed=0 above. A failure must read as one -- a bare "ok"
+    # after --passed 0 has been mistaken for success. Exit code stays 0 so `&&`
+    # chains in the loop keep running.
+    if args.passed == 1:
+        print("ok")
+    else:
+        first = next((ln.strip() for ln in output.splitlines() if ln.strip()), "")
+        first = first[:FAIL_LINE_MAX]
+        print(f"FAIL {args.check}: {first}" if first else f"FAIL {args.check}")
 
 
 def cmd_select_bundle(args: argparse.Namespace) -> None:
     conn = connect()
     conn.row_factory = sqlite3.Row
+    floor = None if args.all_sessions else _session_floor(conn, args.task_id)
+    where = "task_id = ?" if floor is None else "task_id = ? AND ts >= ?"
+    params = (args.task_id,) if floor is None else (args.task_id, floor)
     rows = conn.execute(
-        """SELECT phase, check_name, tool,
+        f"""SELECT phase, check_name, tool,
                   COALESCE(exit_code, '') AS exit_code,
                   CASE passed WHEN 1 THEN 'pass' ELSE 'FAIL' END AS result,
                   substr(COALESCE(output_snippet, ''), 1, 120) AS detail
            FROM anvil_checks
-           WHERE task_id = ?
+           WHERE {where}
            ORDER BY CASE phase WHEN 'baseline' THEN 1 WHEN 'after' THEN 2 WHEN 'review' THEN 3 END, id""",
-        (args.task_id,),
+        params,
     ).fetchall()
     print_table(rows, ["phase", "check_name", "tool", "exit_code", "result", "detail"])
+    if floor is not None:
+        (hidden,) = conn.execute(
+            "SELECT COUNT(*) FROM anvil_checks WHERE task_id = ? AND ts < ?",
+            (args.task_id, floor),
+        ).fetchone()
+        if hidden:
+            print(f"anvil-ledger: {hidden} check(s) from earlier sessions of this task_id "
+                  "hidden; --all-sessions shows them.", file=sys.stderr)
 
 
 def cmd_count_phase(args: argparse.Namespace) -> None:
     conn = connect()
-    row = conn.execute(
-        "SELECT COUNT(*) AS n FROM anvil_checks WHERE task_id = ? AND phase = ?",
-        (args.task_id, args.phase),
-    ).fetchone()
+    floor = _session_floor(conn, args.task_id)
+    if floor is None:
+        row = conn.execute(
+            "SELECT COUNT(*) AS n FROM anvil_checks WHERE task_id = ? AND phase = ?",
+            (args.task_id, args.phase),
+        ).fetchone()
+    else:
+        row = conn.execute(
+            "SELECT COUNT(*) AS n FROM anvil_checks WHERE task_id = ? AND phase = ? AND ts >= ?",
+            (args.task_id, args.phase, floor),
+        ).fetchone()
     print(row[0])
 
 
 def cmd_start_session(args: argparse.Namespace) -> None:
     repo = args.repo_path or str(Path.cwd())
     conn = connect()
+    n_prev, latest = conn.execute(
+        "SELECT COUNT(*), MAX(created_at) FROM sessions WHERE task_id = ?", (args.task_id,)
+    ).fetchone()
+    if n_prev:
+        print(f"anvil-ledger: task_id '{args.task_id}' reused ({n_prev} earlier sessions, "
+              f"latest {str(latest)[:10]}); count-phase/select-bundle now show only this "
+              "session's checks.", file=sys.stderr)
     cur = conn.execute(
         "INSERT INTO sessions (task_id, repo_path, branch) VALUES (?, ?, ?)",
         (args.task_id, repo, args.branch or ""),
@@ -269,6 +337,50 @@ def cmd_memory_list(_args: argparse.Namespace) -> None:
     print_table(rows, ["key", "value", "updated_at"])
 
 
+def cmd_snapshot_diff(args: argparse.Namespace) -> int:
+    """Freeze the staged index the reviewers are about to see.
+
+    Writes the patch to --out and records its manifest, which the commit gate
+    later compares the index against. --out is truncated before git runs, so on
+    any failure a stale patch from an earlier round can never be reviewed.
+
+    The patch and the manifest come from two git calls. The manifest is read on
+    both sides of the patch and must not change, so the gate can never be bound
+    to an index the reviewers' patch does not describe.
+    """
+    cwd = os.getcwd()
+    out = Path(args.out)
+    out.write_bytes(b"")
+    try:
+        manifest = staged_manifest(cwd)
+        patch = run_git(PATCH_ARGS, cwd)
+        if staged_manifest(cwd) != manifest:
+            print("ERROR: the index changed while snapshotting; re-run snapshot-diff",
+                  file=sys.stderr)
+            return 1
+    except (GitError, ValueError, subprocess.SubprocessError) as e:
+        print(f"ERROR: git failed: {e}", file=sys.stderr)
+        return 1
+    out.write_bytes(patch)
+    if not manifest:
+        print("ERROR: nothing staged", file=sys.stderr)
+        return 1
+    sha = hashlib.sha256(patch).hexdigest()
+    conn = connect()
+    session = _newest_session(conn, args.task_id)
+    # The high-water mark is read inside the INSERT itself, so no check can land
+    # between reading it and recording the snapshot.
+    cur = conn.execute(
+        "INSERT INTO review_snapshots "
+        "(session_id, task_id, patch_sha256, manifest, checks_high_water) "
+        "VALUES (?, ?, ?, ?, (SELECT COALESCE(MAX(id), 0) FROM anvil_checks))",
+        (session[0] if session else None, args.task_id, sha, json.dumps(manifest)),
+    )
+    conn.commit()
+    print(f"snapshot {cur.lastrowid}: {len(manifest)} files, sha256 {sha[:12]}")
+    return 0
+
+
 # --- arg parsing --------------------------------------------------------------
 
 def build_parser() -> argparse.ArgumentParser:
@@ -295,6 +407,8 @@ def build_parser() -> argparse.ArgumentParser:
 
     sb = sub.add_parser("select-bundle")
     sb.add_argument("task_id")
+    sb.add_argument("--all-sessions", action="store_true",
+                    help="include checks from earlier sessions of this task_id")
     sb.set_defaults(func=cmd_select_bundle)
 
     cp = sub.add_parser("count-phase")
@@ -325,6 +439,11 @@ def build_parser() -> argparse.ArgumentParser:
     ms = sub.add_parser("memory-set"); ms.add_argument("key"); ms.add_argument("value"); ms.set_defaults(func=cmd_memory_set)
     mg = sub.add_parser("memory-get"); mg.add_argument("key"); mg.set_defaults(func=cmd_memory_get)
     sub.add_parser("memory-list").set_defaults(func=cmd_memory_list)
+
+    sd = sub.add_parser("snapshot-diff")
+    sd.add_argument("--task-id", required=True)
+    sd.add_argument("--out", required=True)
+    sd.set_defaults(func=cmd_snapshot_diff)
 
     return p
 
