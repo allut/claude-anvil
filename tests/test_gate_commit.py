@@ -6,10 +6,11 @@ The gate never writes stdout and never emits JSON.
 from __future__ import annotations
 
 import shlex
+import sqlite3
 
 import pytest
 
-from helpers import hook_payload, run_cli, seed_db
+from helpers import git, hook_payload, make_repo, run_cli, seed_db
 
 OPEN = None  # ended_at IS NULL
 
@@ -413,3 +414,309 @@ def test_non_commit_bash_command_is_never_blocked(tmp_path):
     db = _session_with(("baseline",), tmp_path)
     r = gate(db, commit_payload("git push origin main"))
     assert r.returncode == 0
+
+
+# --- stage-at-commit-time flags -----------------------------------------------
+
+@pytest.mark.parametrize("command,expected", [
+    ("git commit -am x", True),
+    ("git commit -a -m x", True),
+    ("git commit --all -m x", True),
+    ('git commit -m "msg" -a', True),
+    ("git commit -sam x", True),
+    ('bash -c "git commit -am x"', True),
+    ("git status && git commit -am x", True),
+    ("git commit -m x", False),
+    ('git commit -m "fix a bug"', False),     # a quoted message is one token
+    ("git commit --amend --no-edit", False),
+    ("git commit --author=alice -m x", False),
+    ("git add -A && git commit -m x", False),  # -A belongs to `git add`
+    ("git add -a; git commit -m x", False),    # ... and so does this -a
+    # Pathspec commits also stage at commit time; accepted under-block.
+    ("git commit -m x -- a.txt", False),
+])
+def test_commit_stages_worktree(anvil_gate, command, expected):
+    assert anvil_gate.commit_stages_worktree(command) is expected
+
+
+# --- reviewed-snapshot binding ------------------------------------------------
+
+def _repo_with_staged_batch(tmp_path):
+    repo = make_repo(tmp_path / "repo", {"a.txt": "alpha\n", "b.txt": "beta\n",
+                                          "c.txt": "gamma\n"})
+    (repo / "a.txt").write_text("alpha v2\n", encoding="utf-8", newline="\n")
+    (repo / "d.txt").write_text("delta\n", encoding="utf-8", newline="\n")
+    git(repo, "rm", "-q", "b.txt")
+    git(repo, "add", "a.txt", "d.txt")
+    return repo
+
+
+def _snapshot(db, repo):
+    r = run_cli("anvil-ledger", ["snapshot-diff", "--task-id", "task",
+                                 "--out", str(repo.parent / "diff.patch")],
+                env={"ANVIL_DB_PATH": str(db)}, cwd=repo)
+    assert r.returncode == 0, r.stderr
+    return r
+
+
+def _review_now(db):
+    r = run_cli("anvil-ledger", ["insert-check", "--task-id", "task", "--phase", "review",
+                                 "--check", "review-claude", "--tool", "t", "--passed", "1"],
+                env={"ANVIL_DB_PATH": str(db)})
+    assert r.returncode == 0, r.stderr
+
+
+def _reviewed(tmp_path):
+    """Session 7 with full evidence, a staged batch, its snapshot, and a review
+    recorded after the snapshot."""
+    db = _session_with(("baseline", "after", "review"), tmp_path)
+    repo = _repo_with_staged_batch(tmp_path)
+    _snapshot(db, repo)
+    _review_now(db)
+    return db, repo
+
+
+def repo_commit(repo, command="git commit -m x"):
+    return hook_payload("Bash", cwd=repo, command=command)
+
+
+def test_without_a_snapshot_the_gate_only_counts(tmp_path):
+    db = _session_with(("baseline", "after", "review"), tmp_path)
+    repo = _repo_with_staged_batch(tmp_path)
+    (repo / "extra.txt").write_text("never reviewed\n", encoding="utf-8")
+    git(repo, "add", "extra.txt")
+    assert gate(db, repo_commit(repo)).returncode == 0
+
+
+def test_the_reviewed_index_is_allowed(tmp_path):
+    db, repo = _reviewed(tmp_path)
+    r = gate(db, repo_commit(repo))
+    assert r.returncode == 0, r.stderr
+
+
+def test_a_path_subset_of_the_snapshot_is_allowed(tmp_path):
+    """Batch-then-split: the reviewed batch may land as several commits."""
+    db, repo = _reviewed(tmp_path)
+    git(repo, "reset", "-q", "--", "d.txt", "b.txt")
+    r = gate(db, repo_commit(repo))
+    assert r.returncode == 0, r.stderr
+
+
+def test_the_remainder_after_a_split_commit_is_allowed(tmp_path):
+    db, repo = _reviewed(tmp_path)
+    git(repo, "reset", "-q", "--", "d.txt", "b.txt")
+    git(repo, "commit", "-q", "-m", "part one")
+    git(repo, "add", "d.txt")
+    git(repo, "rm", "-q", "--cached", "b.txt")
+    r = gate(db, repo_commit(repo))
+    assert r.returncode == 0, r.stderr
+
+
+def test_a_file_edited_after_the_snapshot_is_blocked(tmp_path):
+    db, repo = _reviewed(tmp_path)
+    (repo / "a.txt").write_text("alpha v3 -- never reviewed\n", encoding="utf-8")
+    git(repo, "add", "a.txt")
+    r = gate(db, repo_commit(repo))
+    assert r.returncode == 2
+    assert "a.txt" in r.stderr
+    assert "d.txt" not in r.stderr          # unchanged entries are not listed
+    assert "snapshot-diff" in r.stderr and "end-session 7" in r.stderr
+    assert r.stdout == ""
+
+
+def test_a_hunk_level_split_of_one_file_is_blocked(tmp_path):
+    """The intermediate blob of a partially staged file was never reviewed."""
+    db = _session_with(("baseline", "after", "review"), tmp_path)
+    repo = make_repo(tmp_path / "repo", {"a.txt": "one\ntwo\n"})
+    (repo / "a.txt").write_text("one changed\ntwo changed\n", encoding="utf-8", newline="\n")
+    git(repo, "add", "a.txt")
+    _snapshot(db, repo)
+    _review_now(db)
+    (repo / "a.txt").write_text("one changed\ntwo\n", encoding="utf-8", newline="\n")
+    git(repo, "add", "a.txt")
+    r = gate(db, repo_commit(repo))
+    assert r.returncode == 2
+    assert "a.txt" in r.stderr
+
+
+def test_a_file_not_in_the_snapshot_is_blocked(tmp_path):
+    db, repo = _reviewed(tmp_path)
+    (repo / "c.txt").write_text("gamma v2\n", encoding="utf-8")
+    git(repo, "add", "c.txt")
+    r = gate(db, repo_commit(repo))
+    assert r.returncode == 2
+    assert "c.txt" in r.stderr
+
+
+def test_the_mismatch_list_is_capped_at_five(tmp_path):
+    db, repo = _reviewed(tmp_path)
+    for i in range(8):
+        (repo / f"new{i}.txt").write_text(f"{i}\n", encoding="utf-8")
+    git(repo, "add", "-A")
+    r = gate(db, repo_commit(repo))
+    assert r.returncode == 2
+    assert sum(f"new{i}.txt" in r.stderr for i in range(8)) == 5
+    assert "+3 more" in r.stderr
+
+
+def test_a_snapshot_without_a_later_review_is_blocked(tmp_path):
+    """The session's review rows (ts T1) all predate the snapshot."""
+    db = _session_with(("baseline", "after", "review"), tmp_path)
+    repo = _repo_with_staged_batch(tmp_path)
+    _snapshot(db, repo)
+    r = gate(db, repo_commit(repo))
+    assert r.returncode == 2
+    assert "reviewed snapshot 1 has no review rows after it" in r.stderr
+
+
+def test_the_newest_snapshot_is_the_one_that_counts(tmp_path):
+    db, repo = _reviewed(tmp_path)
+    (repo / "a.txt").write_text("alpha v3\n", encoding="utf-8")
+    git(repo, "add", "a.txt")
+    _snapshot(db, repo)                      # re-snapshot ...
+    assert gate(db, repo_commit(repo)).returncode == 2   # ... but not yet reviewed
+    _review_now(db)
+    r = gate(db, repo_commit(repo))
+    assert r.returncode == 0, r.stderr
+
+
+def test_a_stale_review_in_the_same_second_does_not_cover_a_resnapshot(tmp_path):
+    """Regression guard (reviewer finding, high). Ordering by 1-second ts let the
+    previous round's review count as "after" a re-snapshot taken in the same
+    second; the gate compares row ids against the snapshot's high-water mark."""
+    db, repo = _reviewed(tmp_path)
+    (repo / "a.txt").write_text("alpha v3\n", encoding="utf-8")
+    git(repo, "add", "a.txt")
+    _snapshot(db, repo)
+    conn = sqlite3.connect(str(db))
+    conn.execute("UPDATE anvil_checks SET ts = (SELECT created_at FROM review_snapshots "
+                 "ORDER BY id DESC LIMIT 1)")
+    conn.commit()
+    conn.close()
+    r = gate(db, repo_commit(repo))
+    assert r.returncode == 2
+    assert "reviewed snapshot 2 has no review rows after it" in r.stderr
+
+
+def test_reviewer_unavailable_is_not_a_review(tmp_path):
+    db = _session_with(("baseline", "after", "review"), tmp_path)
+    repo = _repo_with_staged_batch(tmp_path)
+    _snapshot(db, repo)
+    r = run_cli("anvil-ledger", ["insert-check", "--task-id", "task", "--phase", "review",
+                                 "--check", "reviewer-unavailable", "--tool", "t",
+                                 "--passed", "1"],
+                env={"ANVIL_DB_PATH": str(db)})
+    assert r.returncode == 0, r.stderr
+    assert gate(db, repo_commit(repo)).returncode == 2
+    _review_now(db)
+    assert gate(db, repo_commit(repo)).returncode == 0
+
+
+def test_a_snapshot_of_another_session_is_ignored(tmp_path):
+    db, repo = _reviewed(tmp_path)
+    (repo / "c.txt").write_text("gamma v2\n", encoding="utf-8")
+    git(repo, "add", "c.txt")
+    conn = sqlite3.connect(str(db))
+    conn.execute("UPDATE review_snapshots SET session_id = NULL")
+    conn.commit()
+    conn.close()
+    assert gate(db, repo_commit(repo)).returncode == 0
+
+
+@pytest.mark.parametrize("command", [
+    "git commit -am x",
+    "git commit --all -m x",
+    'bash -c "git commit -a -m x"',
+])
+def test_commit_all_is_blocked_when_a_snapshot_exists(tmp_path, command):
+    db, repo = _reviewed(tmp_path)
+    r = gate(db, repo_commit(repo, command))
+    assert r.returncode == 2
+    assert "stage explicitly with `git add`, then `git commit`" in r.stderr
+
+
+@pytest.mark.parametrize("command,expected", [
+    ("git add x && git commit -m y", True),
+    ("git commit -m x && git add y && git commit -m z", True),
+    ("git rm --cached x; git commit -m y", True),
+    ('bash -c "git add x && git commit -m y"', True),
+    ("git add x && bash -c 'git commit -m y'", True),
+    ("git status && git commit -m x", True),        # blunt: over-blocks read-only git
+    ("git commit -m x", False),
+    ("cd sub && git commit -m x", False),
+    ('git commit -m "$(cat msg.txt)"', False),     # substitution inside quotes is one token
+    ("echo 'git add x' && git commit -m y", False),
+])
+def test_commit_shares_line_with_git(anvil_gate, command, expected):
+    assert anvil_gate.commit_shares_line_with_git(command) is expected
+
+
+@pytest.mark.parametrize("command", [
+    "git add c.txt && git commit -m x",
+    "git commit -m x && git add c.txt && git commit -m y",
+])
+def test_staging_on_the_commit_line_is_blocked_when_a_snapshot_exists(tmp_path, command):
+    """Regression guard (reviewer finding, high). The gate reads the index before
+    the line runs; staging on the same line committed c.txt unreviewed."""
+    db, repo = _reviewed(tmp_path)
+    (repo / "c.txt").write_text("gamma v2 -- never reviewed\n", encoding="utf-8")
+    r = gate(db, repo_commit(repo, command))
+    assert r.returncode == 2
+    assert "separate Bash calls" in r.stderr
+
+
+def test_staging_on_the_commit_line_without_a_snapshot_is_unchanged(tmp_path):
+    db = _session_with(("baseline", "after", "review"), tmp_path)
+    repo = _repo_with_staged_batch(tmp_path)
+    assert gate(db, repo_commit(repo, "git add -A && git commit -m x")).returncode == 0
+
+
+def test_commit_all_without_a_snapshot_is_unchanged(tmp_path):
+    db = _session_with(("baseline", "after", "review"), tmp_path)
+    repo = _repo_with_staged_batch(tmp_path)
+    assert gate(db, repo_commit(repo, "git commit -am x")).returncode == 0
+
+
+def test_a_missing_snapshot_table_falls_back_to_counting(tmp_path):
+    db = _session_with(("baseline", "after", "review"), tmp_path)
+    conn = sqlite3.connect(str(db))
+    conn.execute("DROP TABLE review_snapshots")
+    conn.commit()
+    conn.close()
+    repo = _repo_with_staged_batch(tmp_path)
+    r = gate(db, repo_commit(repo, "git commit -am x"))
+    assert r.returncode == 0
+    assert "fail-open" not in r.stderr
+
+
+def test_a_missing_snapshot_table_never_fails_open(tmp_path):
+    """An old DB still blocks on missing evidence -- the absent table must not be
+    routed into the broad sqlite-error handler that allows the commit."""
+    db = _session_with(("baseline",), tmp_path)
+    conn = sqlite3.connect(str(db))
+    conn.execute("DROP TABLE review_snapshots")
+    conn.commit()
+    conn.close()
+    r = gate(db, commit_payload())
+    assert r.returncode == 2
+    assert "after=0" in r.stderr
+
+
+def test_an_unreadable_index_falls_back_to_counting(tmp_path):
+    db, repo = _reviewed(tmp_path)
+    elsewhere = tmp_path / "not-a-repo"
+    elsewhere.mkdir()
+    r = gate(db, repo_commit(elsewhere))
+    assert r.returncode == 0
+    assert "count-only" in r.stderr
+
+
+def test_the_payload_cwd_decides_which_index_is_read(tmp_path):
+    """Without `cwd` in the payload the gate reads its own working directory."""
+    db, repo = _reviewed(tmp_path)
+    (repo / "c.txt").write_text("gamma v2\n", encoding="utf-8")
+    git(repo, "add", "c.txt")
+    r = run_cli("anvil-gate-commit", [], stdin=commit_payload(),
+                env={"ANVIL_DB_PATH": str(db)}, cwd=repo)
+    assert r.returncode == 2
+    assert "c.txt" in r.stderr

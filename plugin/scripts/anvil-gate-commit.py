@@ -4,6 +4,12 @@
 Blocks `git commit` when an /anvil session is active but the ledger is
 missing evidence in any of the three phases (baseline, after, review).
 
+When the session has a reviewed snapshot (`anvil-ledger.py snapshot-diff`), the
+commit is further bound to it: a review row must postdate the snapshot, every
+staged entry must match the snapshot's entry for that path, and `-a`/`--all` or
+other git commands on the commit's line (which change the index after the gate
+has read it) are refused.
+
 Exit codes follow Claude Code's hook convention:
   0 -> allow the tool call (default for anything not a gated `git commit`).
   2 -> block the tool call; stderr is surfaced back to the model.
@@ -19,12 +25,13 @@ import os
 import re
 import shlex
 import sqlite3
+import subprocess
 import sys
 from pathlib import Path
 
 _SCRIPT_DIR = Path(__file__).resolve().parent
 sys.path.insert(0, str(_SCRIPT_DIR))
-from anvil_shared import db_path  # noqa: E402
+from anvil_shared import GitError, db_path, staged_manifest  # noqa: E402
 
 # Only used when the command line cannot be tokenized (unbalanced quotes). The
 # token walk below is the real detector -- see is_gated_git_commit.
@@ -129,23 +136,26 @@ def _segment_is_gated_commit(segment: list[str]) -> bool:
     return not any(t in BENIGN_FLAGS for t in segment[git_at:])
 
 
-def _wrapped_command_is_gated(segment: list[str], depth: int) -> bool:
+def _segment_runs_git(segment: list[str]) -> bool:
+    return any(_is_git_executable(t) for t in segment)
+
+
+def _wrapped_segments(segment: list[str], depth: int, pred) -> list[list[str]]:
     """Recurse into `bash -c "<command>"` / `eval "<command>"`, which the
     tokenizer leaves as a single opaque token."""
+    found: list[list[str]] = []
     for k, token in enumerate(segment):
         base = _bare(token).replace("\\", "/").rsplit("/", 1)[-1].lower()
         if base in _EVAL_WRAPPERS:
-            if _scan(" ".join(segment[k + 1:]), depth + 1):
-                return True
+            found.extend(_scan(" ".join(segment[k + 1:]), depth + 1, pred))
             continue
         if base not in _SHELL_WRAPPERS:
             continue
         for m in range(k + 1, len(segment) - 1):
             if _DASH_C_RE.match(segment[m]):
-                if _scan(segment[m + 1], depth + 1):
-                    return True
+                found.extend(_scan(segment[m + 1], depth + 1, pred))
                 break
-    return False
+    return found
 
 
 def _tokenize(command: str) -> list[str]:
@@ -161,19 +171,23 @@ def _tokenize(command: str) -> list[str]:
     return list(lex)
 
 
-def _scan(command: str, depth: int) -> bool:
+def _scan(command: str, depth: int, pred=_segment_is_gated_commit) -> list[list[str]]:
+    """Every segment of ``command`` matching ``pred`` (default: a gated
+    `git commit`), wrapped `bash -c` / `eval` commands included."""
     try:
         tokens = _tokenize(command)
     except ValueError:
         # Unbalanced quotes -- we cannot reason about the command. Fail closed
         # on the regex rather than waving through something that says "commit".
-        return bool(GIT_COMMIT_RE.search(command))
+        # The segment's tokens are unknown, so it is reported as an empty one.
+        return [[]] if GIT_COMMIT_RE.search(command) else []
+    found: list[list[str]] = []
     for segment in _split_segments(tokens):
-        if _segment_is_gated_commit(segment):
-            return True
-        if depth < _MAX_WRAPPER_DEPTH and _wrapped_command_is_gated(segment, depth):
-            return True
-    return False
+        if pred(segment):
+            found.append(segment)
+        if depth < _MAX_WRAPPER_DEPTH:
+            found.extend(_wrapped_segments(segment, depth, pred))
+    return found
 
 
 def is_gated_git_commit(command: str) -> bool:
@@ -186,7 +200,47 @@ def is_gated_git_commit(command: str) -> bool:
     """
     if not command:
         return False
-    return _scan(command, 0)
+    return bool(_scan(command, 0))
+
+
+def _segment_stages_worktree(segment: list[str]) -> bool:
+    """`-a`, `--all`, or a short-flag cluster containing `a` (`-am`, `-sam`).
+
+    Same blunt token walk as the commit detector, from the git token onward. A
+    cluster with an attached value (`-mamend`) over-blocks; that is the accepted
+    direction. Pathspec commits (`git commit -- path`, `-o`, `-i`) also stage at
+    commit time and are NOT caught -- a documented under-block.
+    """
+    git_at = next((i for i, t in enumerate(segment) if _is_git_executable(t)), 0)
+    for token in segment[git_at:]:
+        if token == "--all":
+            return True
+        flags = token[1:]
+        if token.startswith("-") and not token.startswith("--") and flags.isalpha() \
+                and "a" in flags:
+            return True
+    return False
+
+
+def commit_stages_worktree(command: str) -> bool:
+    """True when a gated commit on this line stages files at commit time, so the
+    index the gate inspects is not what would be committed."""
+    if not command:
+        return False
+    return any(_segment_stages_worktree(seg) for seg in _scan(command, 0))
+
+
+def commit_shares_line_with_git(command: str) -> bool:
+    """True when a gated commit is not the only git invocation on the line.
+
+    The gate reads the index once, before the line runs, so `git add x && git
+    commit -m y` would commit x unseen. Deliberately blunt: any second git
+    segment counts -- `git status && git commit` over-blocks, and telling a
+    staging command from a read-only one is grammar modelling again.
+    """
+    if not command:
+        return False
+    return len(_scan(command, 0, _segment_runs_git)) > 1
 
 
 def main() -> int:
@@ -252,18 +306,122 @@ def main() -> int:
         print(f"anvil-gate-commit: sqlite error (fail-open): {e}", file=sys.stderr)
         return 0
 
-    if all(counts[p] > 0 for p in ("baseline", "after", "review")):
+    if not all(counts[p] > 0 for p in ("baseline", "after", "review")):
+        sys.stderr.write(
+            BLOCK_MESSAGE.format(
+                task_id=task_id,
+                session_id=session_id,
+                n_baseline=counts["baseline"],
+                n_after=counts["after"],
+                n_review=counts["review"],
+                ledger_path_quoted=_LEDGER_PATH_QUOTED,
+            )
+        )
+        return 2
+
+    return _check_snapshot(conn, data, command, session_id, task_id)
+
+
+def _load_snapshot(conn: sqlite3.Connection, session_id: int, task_id: str):
+    """(id, manifest, n_reviews_after) for the session's newest snapshot, or None.
+
+    Runs in its own try so that nothing here can reach main()'s broad sqlite
+    handler. A DB from before review_snapshots existed has no such table: that is
+    the old flow, and the gate stays count-only (the counts already passed).
+    """
+    try:
+        row = conn.execute(
+            "SELECT id, checks_high_water, manifest FROM review_snapshots "
+            "WHERE session_id = ? ORDER BY id DESC LIMIT 1",
+            (session_id,),
+        ).fetchone()
+        if not row:
+            return None
+        snap_id, high_water, manifest_json = row
+        # Ordered by row id, not by ts: timestamps have 1-second resolution, and a
+        # stale review in the same second as a re-snapshot would read as fresh.
+        # reviewer-unavailable records a missing reviewer, not a review.
+        (n_reviews,) = conn.execute(
+            "SELECT COUNT(*) FROM anvil_checks "
+            "WHERE task_id = ? AND phase = 'review' AND id > ? "
+            "  AND check_name != 'reviewer-unavailable'",
+            (task_id, high_water),
+        ).fetchone()
+        manifest = json.loads(manifest_json)
+        reviewed = {e["path"]: (e["status"], e["dst_mode"], e["dst_sha"]) for e in manifest}
+    except sqlite3.OperationalError as e:
+        if "no such table" not in str(e):
+            print(f"anvil-gate-commit: cannot read review snapshot (count-only): {e}",
+                  file=sys.stderr)
+        return None
+    except (sqlite3.Error, ValueError, KeyError, TypeError) as e:
+        print(f"anvil-gate-commit: cannot read review snapshot (count-only): {e}",
+              file=sys.stderr)
+        return None
+    return snap_id, reviewed, n_reviews
+
+
+def _check_snapshot(conn: sqlite3.Connection, data: dict, command: str,
+                    session_id: int, task_id: str) -> int:
+    """Bind the commit to the diff the reviewers saw.
+
+    Every staged entry must match the session's newest snapshot on (status,
+    dst_mode, dst_sha). A path subset is fine (batch reviewed, committed in
+    several commits); new content, a file outside the snapshot, or a hunk-level
+    split of one file (its intermediate blob was never reviewed) is not.
+    """
+    snapshot = _load_snapshot(conn, session_id, task_id)
+    if snapshot is None:
+        return 0
+    snap_id, reviewed, n_reviews = snapshot
+    end_session = (f"  python {_LEDGER_PATH_QUOTED} end-session {session_id} \"<recap>\"\n")
+
+    if commit_stages_worktree(command):
+        sys.stderr.write(
+            f"anvil: commit blocked -- `git commit -a`/`--all` stages files at commit "
+            f"time, so the index checked against reviewed snapshot {snap_id} is not what "
+            f"would be committed.\nstage explicitly with `git add`, then `git commit`.\n"
+        )
+        return 2
+
+    if commit_shares_line_with_git(command):
+        sys.stderr.write(
+            f"anvil: commit blocked -- the gate checks the index against reviewed snapshot "
+            f"{snap_id} before this command line runs, so other git commands on the same "
+            f"line (`git add ... && git commit`) could change what is committed.\n"
+            f"Run staging and `git commit` as separate Bash calls.\n"
+        )
+        return 2
+
+    if n_reviews == 0:
+        sys.stderr.write(
+            f"anvil: commit blocked -- reviewed snapshot {snap_id} has no review rows "
+            f"after it (task {task_id}).\nRun the step 5c reviewers on it, or end the "
+            f"session to commit outside the workflow:\n{end_session}"
+        )
+        return 2
+
+    cwd = data.get("cwd") or os.getcwd()
+    try:
+        staged = staged_manifest(cwd)
+    except (OSError, GitError, ValueError, subprocess.SubprocessError) as e:
+        print(f"anvil-gate-commit: cannot read the staged index in {cwd} "
+              f"(count-only): {e}", file=sys.stderr)
         return 0
 
+    mismatched = [e["path"] for e in staged
+                  if reviewed.get(e["path"]) != (e["status"], e["dst_mode"], e["dst_sha"])]
+    if not mismatched:
+        return 0
+    shown = ", ".join(mismatched[:5])
+    if len(mismatched) > 5:
+        shown += f" (+{len(mismatched) - 5} more)"
     sys.stderr.write(
-        BLOCK_MESSAGE.format(
-            task_id=task_id,
-            session_id=session_id,
-            n_baseline=counts["baseline"],
-            n_after=counts["after"],
-            n_review=counts["review"],
-            ledger_path_quoted=_LEDGER_PATH_QUOTED,
-        )
+        f"anvil: commit blocked -- staged content differs from reviewed snapshot "
+        f"{snap_id} (task {task_id})\n"
+        f"  not reviewed as staged: {shown}\n"
+        f"Re-run step 5c (`anvil-ledger.py snapshot-diff` + reviewers) on the current "
+        f"index, or end the session to commit outside the workflow:\n{end_session}"
     )
     return 2
 
